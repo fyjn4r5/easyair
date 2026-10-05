@@ -1,11 +1,11 @@
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QGroupBox,
     QSplitter, QFileDialog, QMessageBox, QCheckBox, QListWidget,
     QListWidgetItem, QAbstractItemView, QMenu, QAction, QInputDialog,
     QLineEdit, QSpinBox, QDialog, QDialogButtonBox, QFormLayout,
     QTabWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QFrame,
-    QSystemTrayIcon, QStyle, QApplication
+    QSystemTrayIcon, QStyle, QApplication, QPlainTextEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
@@ -133,37 +133,147 @@ class WordListDialog(QDialog):
 
 
 class CrackResultWidget(QTreeWidget):
+    COL_BSSID, COL_ESSID, COL_PWD, COL_CAP, COL_STATE, COL_TIME, COL_NOTE = range(7)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setHeaderLabels(["BSSID", "ESSID", "密码", "握手包", "状态", "耗时"])
-        self.setColumnWidth(0, 180)
-        self.setColumnWidth(1, 150)
-        self.setColumnWidth(2, 180)
-        self.setColumnWidth(3, 200)
-        self.setColumnWidth(4, 80)
-        self.setColumnWidth(5, 80)
+        self.setHeaderLabels(["BSSID", "SSID", "密码", "握手包", "状态", "耗时", "备注"])
+        header = self.header()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        for idx, w in enumerate((170, 130, 160, 180, 80, 80, 150)):
+            self.setColumnWidth(idx, w)
         self.setAlternatingRowColors(True)
         self.setRootIsDecorated(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
-    def add_target(self, bssid, essid, cap_file):
-        item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00"])
+    def add_target(self, bssid, essid, cap_file, note=""):
+        item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00", note])
         item.setData(0, Qt.UserRole, {"bssid": bssid, "essid": essid, "cap": cap_file})
         self.addTopLevelItem(item)
         return item
 
+    def to_record(self, item) -> dict:
+        return {
+            "bssid": item.text(self.COL_BSSID),
+            "essid": item.text(self.COL_ESSID),
+            "password": item.text(self.COL_PWD),
+            "cap": item.text(self.COL_CAP),
+            "status": item.text(self.COL_STATE),
+            "elapsed": item.text(self.COL_TIME),
+            "note": item.text(self.COL_NOTE),
+        }
+
+    def load_record(self, rec: dict):
+        item = QTreeWidgetItem([
+            rec.get("bssid", ""), rec.get("essid", ""),
+            rec.get("password", "") or "破解中...",
+            rec.get("cap", ""), rec.get("status", ""),
+            rec.get("elapsed", ""), rec.get("note", ""),
+        ])
+        self.addTopLevelItem(item)
+        state = rec.get("status", "")
+        if state == "成功":
+            self._paint_success(item)
+        elif state and state not in ("进行中",):
+            item.setText(self.COL_STATE, state)
+            item.setForeground(self.COL_STATE, QColor("#c62828"))
+        return item
+
+    def _paint_success(self, item):
+        item.setForeground(self.COL_STATE, QColor("#2e7d32"))
+        item.setForeground(self.COL_PWD, QColor("#1565c0"))
+
     def update_progress(self, item, password, elapsed):
         if password:
-            item.setText(2, password)
-            item.setText(4, "成功")
-            item.setForeground(4, QColor("#2e7d32"))
-            item.setForeground(2, QColor("#1565c0"))
-        else:
-            item.setText(5, elapsed)
-        self.scrollToItem(item)
+            item.setText(self.COL_PWD, password)
+            item.setText(self.COL_STATE, "成功")
+            item.setForeground(self.COL_STATE, QColor("#2e7d32"))
+            item.setForeground(self.COL_PWD, QColor("#1565c0"))
+            self.scrollToItem(item)
+        item.setText(self.COL_TIME, elapsed)
 
     def set_failed(self, item, reason="失败"):
-        item.setText(4, reason)
-        item.setForeground(4, QColor("#c62828"))
+        item.setText(self.COL_STATE, reason)
+        item.setForeground(self.COL_STATE, QColor("#c62828"))
+
+    def set_note(self, item, note):
+        item.setText(self.COL_NOTE, note)
+
+    def current_record(self):
+        items = self.selectedItems()
+        return items[0] if items else None
+
+
+class CrackSettingsDialog(QDialog):
+    ENGINES = ["Hashcat (GPU/CPU)", "Aircrack-ng (CPU)"]
+    DEVICES = ["GPU + CPU (自动)", "仅 GPU", "仅 CPU"]
+
+    def __init__(self, parent=None, config=None):
+        super().__init__(parent)
+        self.setWindowTitle("破解设置")
+        self.setMinimumWidth(430)
+        config = config or {}
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(self.ENGINES)
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(self.DEVICES)
+        self.engine_combo.currentTextChanged.connect(self._sync_device)
+        form.addRow("破解引擎:", self.engine_combo)
+        form.addRow("计算设备:", self.device_combo)
+
+        self.extra_args = QLineEdit(config.get("hashcat_extra_args", ""))
+        self.extra_args.setPlaceholderText("--force --opencl-device-types 1,2")
+        form.addRow("Hashcat 额外参数:", self.extra_args)
+
+        self.auto_mon = QCheckBox("自动监听模式 (扫描时自动开启)")
+        self.auto_mon.setChecked(config.get("auto_monitor", True))
+        form.addRow(self.auto_mon)
+
+        self.scan_secs = QSpinBox()
+        self.scan_secs.setRange(0, 3600)
+        self.scan_secs.setSingleStep(15)
+        self.scan_secs.setSuffix(" 秒")
+        self.scan_secs.setSpecialValueText("手动停止")
+        self.scan_secs.setValue(int(config.get("scan_auto_stop", 0) or 0))
+        form.addRow("扫描自动停止:", self.scan_secs)
+
+        layout.addLayout(form)
+
+        hint = QLabel("提示: Aircrack-ng 仅支持 CPU，切换引擎时设备会自动锁定。\n"
+                      "停止扫描不会关闭监听模式，可直接继续抓取握手包。")
+        hint.setStyleSheet("color: #888;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.engine_combo.setCurrentText(config.get("crack_engine", self.ENGINES[0]))
+        self.device_combo.setCurrentText(config.get("crack_device", self.DEVICES[0]))
+        self._sync_device(self.engine_combo.currentText())
+
+    def _sync_device(self, engine: str):
+        is_aircrack = engine.startswith("Aircrack")
+        self.device_combo.setEnabled(not is_aircrack)
+        if is_aircrack:
+            self.device_combo.setCurrentText(self.DEVICES[2])
+
+    def values(self) -> dict:
+        return {
+            "crack_engine": self.engine_combo.currentText(),
+            "crack_device": self.device_combo.currentText(),
+            "hashcat_extra_args": self.extra_args.text().strip(),
+            "auto_monitor": self.auto_mon.isChecked(),
+            "scan_auto_stop": self.scan_secs.value(),
+        }
 
 
 class MainUI(QWidget):
@@ -189,6 +299,7 @@ class MainUI(QWidget):
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
+        # ===== 顶部工具栏 =====
         toolbar = QFrame()
         toolbar.setFrameShape(QFrame.StyledPanel)
         toolbar.setMaximumHeight(50)
@@ -205,6 +316,7 @@ class MainUI(QWidget):
 
         tb_layout.addSpacing(10)
 
+        # 监听模式状态指示器 (带图标的按钮) - 关键：补回这个按钮
         self.btn_mon_toggle = QPushButton()
         self.btn_mon_toggle.setCheckable(True)
         self.btn_mon_toggle.setFixedSize(40, 40)
@@ -245,143 +357,273 @@ class MainUI(QWidget):
 
         tb_layout.addStretch()
 
-        self.btn_dict_mgr = QPushButton("📁 字典管理")
-        self.btn_dict_mgr.setMinimumWidth(100)
+        self.btn_dict_mgr = QPushButton("📁 字典")
+        self.btn_dict_mgr.setMinimumWidth(84)
         tb_layout.addWidget(self.btn_dict_mgr)
 
-        self.btn_crack_cfg = QPushButton("⚙ 破解设置")
-        self.btn_crack_cfg.setMinimumWidth(100)
+        self.btn_crack_cfg = QPushButton("⚙ 设置")
+        self.btn_crack_cfg.setMinimumWidth(84)
         tb_layout.addWidget(self.btn_crack_cfg)
 
         root.addWidget(toolbar)
 
+        # ===== 状态条: 左侧目标信息 / 右侧引擎与破解进度 =====
+        # 把所有全局信息收进这一条, 两侧面板只留「表格 + 按钮行」,
+        # 结构完全对称 => AP 表与破解结果表高度一致
+        target_bar = QFrame()
+        target_bar.setObjectName("targetBar")
+        target_bar.setFixedHeight(40)
+        tgt_layout = QHBoxLayout(target_bar)
+        tgt_layout.setContentsMargins(12, 0, 12, 0)
+        tgt_layout.setSpacing(8)
+
+        title = QLabel("当前目标")
+        title.setStyleSheet("font-weight: bold; color: #37474f;")
+        tgt_layout.addWidget(title)
+
+        self.lbl_target_essid = self._add_target_field(tgt_layout, "SSID", "未选择")
+        self.lbl_target_bssid = self._add_target_field(tgt_layout, "BSSID", "未选择")
+        self.lbl_target_ch = self._add_target_field(tgt_layout, "信道", "--")
+        self.lbl_target_enc = self._add_target_field(tgt_layout, "加密", "--")
+        self.lbl_handshake = QLabel("握手包 未捕获")
+        self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
+        tgt_layout.addWidget(self.lbl_handshake)
+        tgt_layout.addSpacing(16)
+
+        tgt_layout.addStretch()
+
+        self.lbl_engine = QLabel("Hashcat · GPU+CPU")
+        self.lbl_engine.setStyleSheet("color: #1565c0; font-weight: bold;")
+        tgt_layout.addWidget(self.lbl_engine)
+        self.btn_change_engine = QPushButton("更改")
+        self.btn_change_engine.setFixedSize(56, 24)
+        tgt_layout.addWidget(self.btn_change_engine)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedSize(150, 12)
+        self.progress_bar.setTextVisible(False)
+        tgt_layout.addWidget(self.progress_bar)
+        self.lbl_progress = QLabel("等待开始")
+        self.lbl_progress.setStyleSheet("color: #607d8b;")
+        self.lbl_progress.setFixedWidth(150)
+        tgt_layout.addWidget(self.lbl_progress)
+        self.scan_elapsed = QLabel("")
+        self.scan_elapsed.setStyleSheet("color: #90a4ae;")
+        self.scan_elapsed.setFixedWidth(190)
+        tgt_layout.addWidget(self.scan_elapsed)
+
+        root.addWidget(target_bar)
+
+        # ===== 中部: 左右对称, 两个表格等宽等高 =====
         main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
 
-        left_widget = QWidget()
-        left_layout = QVBoxLayout(left_widget)
-        left_layout.setSpacing(6)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-
-        ap_group = QGroupBox("周边 AP (双击选择目标)")
-        ap_layout = QVBoxLayout(ap_group)
+        # ---- 左侧: 周边 AP ----
+        ap_group = QGroupBox("周边 AP  ·  双击设为目标")
+        ap_group_layout = QVBoxLayout(ap_group)
+        ap_group_layout.setContentsMargins(8, 6, 8, 8)
+        ap_group_layout.setSpacing(6)
 
         self.ap_table = QTableWidget()
         self.ap_table.setColumnCount(7)
-        self.ap_table.setHorizontalHeaderLabels(["信号", "SSID", "BSSID", "信道", "加密", "厂商", "客户端"])
-        self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ap_table.setHorizontalHeaderLabels(["信号", "SSID", "BSSID", "信道", "加密", "认证", "强度"])
+        ap_header = self.ap_table.horizontalHeader()
+        ap_header.setSectionResizeMode(QHeaderView.Interactive)
+        ap_header.setStretchLastSection(False)
+        ap_header.setHighlightSections(False)
+        for idx, w in enumerate((48, 150, 165, 50, 100, 78, 58)):
+            self.ap_table.setColumnWidth(idx, w)
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.ap_table.setAlternatingRowColors(True)
         self.ap_table.setShowGrid(False)
         self.ap_table.verticalHeader().setVisible(False)
+        self.ap_table.setWordWrap(False)
         self.ap_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        ap_layout.addWidget(self.ap_table)
+        ap_group_layout.addWidget(self.ap_table, 1)
 
         ctrl_layout = QHBoxLayout()
-        self.btn_scan = QPushButton("🔍 开始扫描")
-        self.btn_scan.setMinimumHeight(36)
+        ctrl_layout.setSpacing(6)
+        self.btn_scan = QPushButton("🔍 扫描")
         self.btn_scan.setStyleSheet("font-weight: bold; background: #1976d2; color: white;")
-        self.btn_stop_scan = QPushButton("⏹ 停止扫描")
-        self.btn_stop_scan.setMinimumHeight(36)
+        self.btn_stop_scan = QPushButton("⏹ 停止")
         self.btn_stop_scan.setEnabled(False)
-        self.btn_capture = QPushButton("📡 抓取握手包")
-        self.btn_capture.setMinimumHeight(36)
+        self.btn_capture = QPushButton("📡 抓握手包")
         self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
         self.btn_deauth = QPushButton("💥 Deauth")
-        self.btn_deauth.setMinimumHeight(36)
-        ctrl_layout.addWidget(self.btn_scan)
-        ctrl_layout.addWidget(self.btn_stop_scan)
-        ctrl_layout.addWidget(self.btn_capture)
-        ctrl_layout.addWidget(self.btn_deauth)
-        ap_layout.addLayout(ctrl_layout)
+        self.btn_deauth.setToolTip("对目标 AP 发送 deauth，促使客户端重连以便抓握手包")
+        for b in (self.btn_scan, self.btn_stop_scan, self.btn_capture, self.btn_deauth):
+            b.setMinimumHeight(32)
+            ctrl_layout.addWidget(b)
+        ap_group_layout.addLayout(ctrl_layout)
 
-        self.status_label = QLabel("就绪 - 点击'开始扫描'搜索周边 AP")
-        self.status_label.setStyleSheet("color: #666; padding: 4px;")
-        ap_layout.addWidget(self.status_label)
+        main_splitter.addWidget(ap_group)
 
-        left_layout.addWidget(ap_group)
-
-        target_group = QGroupBox("当前目标")
-        target_layout = QFormLayout(target_group)
-        self.lbl_target_essid = QLabel("未选择")
-        self.lbl_target_bssid = QLabel("未选择")
-        self.lbl_target_ch = QLabel("未选择")
-        self.lbl_target_enc = QLabel("未选择")
-        self.lbl_handshake = QLabel("未捕获")
-        self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
-        target_layout.addRow("SSID:", self.lbl_target_essid)
-        target_layout.addRow("BSSID:", self.lbl_target_bssid)
-        target_layout.addRow("信道:", self.lbl_target_ch)
-        target_layout.addRow("加密:", self.lbl_target_enc)
-        target_layout.addRow("握手包:", self.lbl_handshake)
-        left_layout.addWidget(target_group)
-
-        main_splitter.addWidget(left_widget)
-
-        right_widget = QWidget()
-        right_layout = QVBoxLayout(right_widget)
-        right_layout.setSpacing(6)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-
-        engine_group = QGroupBox("破解引擎")
-        engine_layout = QHBoxLayout(engine_group)
-        engine_layout.addWidget(QLabel("引擎:"))
-        self.crack_engine = QComboBox()
-        self.crack_engine.addItems(["Hashcat (GPU/CPU)", "Aircrack-ng (CPU)"])
-        engine_layout.addWidget(self.crack_engine)
-        engine_layout.addWidget(QLabel("设备:"))
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(["GPU + CPU (自动)", "仅 GPU", "仅 CPU"])
-        engine_layout.addWidget(self.device_combo)
-        engine_layout.addStretch()
-        right_layout.addWidget(engine_group)
-
-        progress_group = QGroupBox("破解进度")
-        progress_layout = QVBoxLayout(progress_group)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(False)
-        progress_layout.addWidget(self.progress_bar)
-        self.lbl_progress = QLabel("等待开始...")
-        self.lbl_progress.setStyleSheet("color: #666;")
-        progress_layout.addWidget(self.lbl_progress)
-        right_layout.addWidget(progress_group)
-
-        result_group = QGroupBox("破解结果")
+        # ---- 右侧: 破解结果 (与左侧结构完全一致) ----
+        result_group = QGroupBox("破解结果  ·  按日期归类")
         result_layout = QVBoxLayout(result_group)
-        self.crack_result = CrackResultWidget()
-        result_layout.addWidget(self.crack_result)
+        result_layout.setContentsMargins(8, 6, 8, 8)
+        result_layout.setSpacing(6)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setDocumentMode(True)
+        result_layout.addWidget(self.result_tabs, 1)
 
         result_btn_layout = QHBoxLayout()
+        result_btn_layout.setSpacing(6)
         self.btn_start_crack = QPushButton("▶ 开始破解")
-        self.btn_start_crack.setMinimumHeight(40)
-        self.btn_start_crack.setStyleSheet("font-weight: bold; background: #2e7d32; color: white; font-size: 14px;")
-        self.btn_stop_crack = QPushButton("⏹ 停止破解")
-        self.btn_stop_crack.setMinimumHeight(40)
-        self.btn_stop_crack.setStyleSheet("font-weight: bold; background: #c62828; color: white; font-size: 14px;")
+        self.btn_start_crack.setStyleSheet("font-weight: bold; background: #2e7d32; color: white;")
+        self.btn_stop_crack = QPushButton("⏹ 停止")
+        self.btn_stop_crack.setStyleSheet("font-weight: bold; background: #c62828; color: white;")
         self.btn_stop_crack.setEnabled(False)
-        self.btn_export = QPushButton("📤 导出结果")
-        result_btn_layout.addWidget(self.btn_start_crack)
-        result_btn_layout.addWidget(self.btn_stop_crack)
-        result_btn_layout.addWidget(self.btn_export)
+        self.btn_note = QPushButton("📝 备注")
+        self.btn_note.setToolTip("为选中记录添加备注，如破解地点")
+        self.btn_del_record = QPushButton("🗑 删除")
+        self.btn_export = QPushButton("📤 导出")
+        for b in (self.btn_start_crack, self.btn_stop_crack,
+                  self.btn_note, self.btn_del_record, self.btn_export):
+            b.setMinimumHeight(32)
+            result_btn_layout.addWidget(b)
         result_layout.addLayout(result_btn_layout)
 
-        right_layout.addWidget(result_group)
-
-        main_splitter.addWidget(right_widget)
+        main_splitter.addWidget(result_group)
         main_splitter.setStretchFactor(0, 1)
         main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([540, 540])
 
-        root.addWidget(main_splitter, 1)
+        # ===== 竖向分割: 上下可拖拽 =====
+        body_splitter = QSplitter(Qt.Vertical)
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.addWidget(main_splitter)
+        body_splitter.addWidget(self._build_bottom_tabs())
+        body_splitter.setStretchFactor(0, 5)
+        body_splitter.setStretchFactor(1, 2)
+        body_splitter.setSizes([500, 210])
 
-        log_group = QGroupBox("运行日志")
-        log_layout = QVBoxLayout(log_group)
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(150)
-        self.log_box.setFont(QFont("Monospace", 9))
-        log_layout.addWidget(self.log_box)
-        root.addWidget(log_group)
+        root.addWidget(body_splitter, 1)
+
+        # ===== 底部状态行 =====
+        status_line = QFrame()
+        status_line.setObjectName("targetBar")
+        status_line.setFixedHeight(26)
+        st_layout = QHBoxLayout(status_line)
+        st_layout.setContentsMargins(12, 0, 12, 0)
+        self.status_label = QLabel("就绪 · 点击「扫描」搜索周边 AP")
+        self.status_label.setStyleSheet("color: #455a64;")
+        st_layout.addWidget(self.status_label)
+        st_layout.addStretch()
+        root.addWidget(status_line)
+
+        self.setStyleSheet(self._app_stylesheet())
+
+    def _add_target_field(self, layout, name, value):
+        cap = QLabel(name)
+        cap.setStyleSheet("color: #90a4ae;")
+        val = QLabel(value)
+        val.setStyleSheet("color: #263238; font-weight: bold;")
+        val.setMinimumWidth(90)
+        val.setToolTip(value)
+        layout.addWidget(cap)
+        layout.addWidget(val)
+        return val
+
+    def _build_bottom_tabs(self):
+        """底部 Tab: 握手包库 / 抓包日志 / 破解日志 —— 全部收进一处, 主界面更干净"""
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setDocumentMode(True)
+
+        cap_page = QWidget()
+        cap_layout = QVBoxLayout(cap_page)
+        cap_layout.setContentsMargins(6, 6, 6, 6)
+        self.cap_tree = QTreeWidget()
+        self.cap_tree.setHeaderLabels(["日期 / 握手包", "大小"])
+        cap_header = self.cap_tree.header()
+        cap_header.setSectionResizeMode(QHeaderView.Interactive)
+        cap_header.setStretchLastSection(False)
+        self.cap_tree.setColumnWidth(0, 460)
+        self.cap_tree.setColumnWidth(1, 90)
+        self.cap_tree.setAlternatingRowColors(True)
+        self.cap_tree.setRootIsDecorated(True)
+        cap_layout.addWidget(self.cap_tree)
+        self.bottom_tabs.addTab(cap_page, "📦 握手包库  (双击载入)")
+
+        self.log_scan_box = self._make_log_box()
+        self.log_crack_box = self._make_log_box()
+        self.bottom_tabs.addTab(self.log_scan_box, "📡 抓包日志")
+        self.bottom_tabs.addTab(self.log_crack_box, "🔓 破解日志")
+        # 兼容旧引用
+        self.log_tabs = self.bottom_tabs
+        return self.bottom_tabs
+
+    @staticmethod
+    def _app_stylesheet():
+        return """
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid #dfe6ea;
+            border-radius: 6px;
+            margin-top: 10px;
+            background: #ffffff;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 4px;
+            color: #546e7a;
+        }
+        QFrame#targetBar {
+            background: #f4f7f9;
+            border: 1px solid #e3eaee;
+            border-radius: 6px;
+        }
+        QPushButton {
+            border: 1px solid #cfd8dc;
+            border-radius: 4px;
+            background: #fafbfc;
+            padding: 4px 10px;
+        }
+        QPushButton:hover { background: #eceff1; }
+        QPushButton:disabled { color: #b0bec5; background: #f5f7f8; }
+        QTableWidget, QTreeWidget {
+            gridline-color: #eceff1;
+            selection-background-color: #bbdefb;
+            selection-color: #0d47a1;
+        }
+        QHeaderView::section {
+            background: #f4f7f9;
+            border: none;
+            border-right: 1px solid #e3eaee;
+            border-bottom: 1px solid #e3eaee;
+            padding: 5px 4px;
+            color: #455a64;
+            font-weight: bold;
+        }
+        QTabWidget::pane { border: 1px solid #dfe6ea; border-radius: 4px; }
+        QTabBar::tab {
+            padding: 5px 14px;
+            border: 1px solid #dfe6ea;
+            border-bottom: none;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+            background: #f0f3f5;
+            color: #607d8b;
+        }
+        QTabBar::tab:selected {
+            background: #ffffff;
+            color: #1565c0;
+            font-weight: bold;
+        }
+        """
+
+    def _make_log_box(self):
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setMaximumBlockCount(800)
+        box.setFont(QFont("Monospace", 9))
+        box.setLineWrapMode(QPlainTextEdit.NoWrap)
+        return box
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():

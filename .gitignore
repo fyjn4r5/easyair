@@ -6,6 +6,11 @@ build/
 dist/
 *.spec
 config/settings.json
+config/history.json
 captures/*
 wordlists/*
 .DS_Store
+/easyair
+/easyair_*
+*.zip
+无标题文档
