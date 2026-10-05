@@ -45,10 +45,10 @@ jobs:
           pip install --upgrade pip setuptools wheel
           pip install PyQt5 psutil pyinstaller
 
-      - name: Verify imports
+      - name: Verify imports (offscreen)
         run: |
           source .venv/bin/activate
-          xvfb-run -a python3 -c "
+          QT_QPA_PLATFORM=offscreen python3 -c "
           import sys
           sys.path.insert(0, '.')
           from PyQt5.QtWidgets import QApplication
@@ -90,7 +90,7 @@ jobs:
         run: |
           ls -lh dist/easyair
           file dist/easyair
-          xvfb-run -a timeout 5 ./dist/easyair 2>&1 || true
+          QT_QPA_PLATFORM=offscreen timeout 5 ./dist/easyair 2>&1 || true
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
