@@ -21,6 +21,7 @@ class AirCore:
         self.config_dir.mkdir(exist_ok=True)
         self._load_config()
         self._sudo_password = None
+        self._password_verified = False
 
     def _load_config(self):
         self.config = {
@@ -91,16 +92,63 @@ class AirCore:
                 pass
         return None
 
+    def _verify_sudo_password(self, pwd: str) -> bool:
+        """验证 sudo 密码是否正确"""
+        try:
+            # 使用 sudo -v 测试密码，不执行命令
+            proc = subprocess.run(
+                ["sudo", "-S", "-v"],
+                input=pwd + "\n",
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
     def _run_sudo_cmd(self, cmd: str) -> subprocess.Popen:
         """统一执行 sudo 命令，自动处理密码"""
         pwd = self._get_sudo_password()
+        
+        if pwd and not self._password_verified:
+            # 首次使用时验证密码
+            if self._verify_sudo_password(pwd):
+                self._password_verified = True
+                self.log(f"[sudo] 密码验证通过")
+            else:
+                self.log(f"[sudo] 密码验证失败，将使用 pkexec")
+                pwd = None
+        
         if pwd:
-            full_cmd = f"echo '{pwd}' | sudo -S {cmd}"
+            # 使用 sudo -S，密码通过 stdin 传递，不回显
+            full_cmd = ["sudo", "-S", "-p", ""] + shlex.split(cmd)
+            proc = subprocess.Popen(
+                full_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding='utf-8',
+                errors='replace'
+            )
+            # 写入密码并关闭 stdin
+            proc.stdin.write(pwd + "\n")
+            proc.stdin.close()
+            return proc
         else:
+            # 回退到 pkexec
             full_cmd = f"pkexec {cmd}"
-        return subprocess.Popen(shlex.split(full_cmd), stdout=subprocess.PIPE, 
-                                stderr=subprocess.STDOUT, text=True, bufsize=1, 
-                                encoding='utf-8', errors='replace')
+            return subprocess.Popen(
+                shlex.split(full_cmd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                encoding='utf-8',
+                errors='replace'
+            )
 
     def run_cmd(self, cmd: str, sudo: bool = False, shell: bool = False):
         if sudo:
@@ -149,7 +197,6 @@ class AirCore:
                 subprocess.run(["sudo", "airmon-ng", "stop", mon], capture_output=True, timeout=5)
             except Exception:
                 pass
-        # 也尝试直接 stop 物理接口
         try:
             subprocess.run(["sudo", "airmon-ng", "stop", iface], capture_output=True, timeout=5)
         except Exception:
@@ -184,6 +231,8 @@ class AirCore:
 
     def ensure_monitor(self, iface: str) -> Tuple[bool, str]:
         """确保接口在监听模式，返回(成功, 监听接口名)"""
+        self._password_verified = False  # 重置验证状态
+        
         # 先清理
         self._cleanup_monitor(iface)
         time.sleep(0.3)
@@ -194,10 +243,9 @@ class AirCore:
         
         # 启动
         p = self.start_monitor(iface)
-        # 等待完成，最多 10 秒
         start_time = time.time()
         output_lines = []
-        while time.time() - start_time < 10:
+        while time.time() - start_time < 15:
             line = p.stdout.readline()
             if not line and p.poll() is not None:
                 break
@@ -210,6 +258,7 @@ class AirCore:
         # 查找生成的监听接口
         mon = self.get_monitor_interface(iface)
         if mon and self.check_monitor_mode(mon):
+            self.log(f"[监听模式] 成功开启: {mon}")
             return True, mon
         
         # 兜底：从输出中提取
@@ -219,8 +268,10 @@ class AirCore:
                 if match:
                     mon = match.group(1)
                     if self.check_monitor_mode(mon):
+                        self.log(f"[监听模式] 从输出解析到: {mon}")
                         return True, mon
         
+        self.log(f"[监听模式] 开启失败，输出: {output_lines}")
         return False, ""
 
     def airodump_scan(self, mon_iface: str, outfile_prefix: str = "scan"):
