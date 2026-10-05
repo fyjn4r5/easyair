@@ -40,9 +40,13 @@ class AirCore:
         self.caps_dir = self.base_dir / "captures"
         self.wordlists_dir = self.base_dir / "wordlists"
         self.config_dir = self.base_dir / "config"
-        self.caps_dir.mkdir(exist_ok=True)
-        self.wordlists_dir.mkdir(exist_ok=True)
-        self.config_dir.mkdir(exist_ok=True)
+        # 必须 parents=True: 打包后 ~/.easyair 尚不存在时,
+        # 否则 mkdir 会抛 FileNotFoundError 导致启动即崩溃
+        for d in (self.caps_dir, self.wordlists_dir, self.config_dir):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:  # 只读目录等极端情况不应阻止启动
+                print(f"[目录创建失败] {d}: {e}")
         self._load_config()
         self._sudo_password = None
         self._password_verified = False
