@@ -14,6 +14,16 @@ sys.path.insert(0, str(ROOT))
 PASS, FAIL = [], []
 
 
+def _call(fn):
+    """执行 fn, 返回 True 表示没抛异常。"""
+    try:
+        fn()
+        return True
+    except Exception as e:  # noqa: BLE001
+        print(f"      !! {type(e).__name__}: {e}")
+        return False
+
+
 def check(name, cond, detail=""):
     (PASS if cond else FAIL).append(name)
     print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  <- {detail}" if detail and not cond else ""))
@@ -25,7 +35,7 @@ def section(title):
 
 
 def pump(ms):
-    from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtWidgets import QApplication, QMenu
     from PyQt5.QtCore import QEventLoop, QTimer
     loop = QEventLoop()
     QTimer.singleShot(ms, loop.quit)
@@ -1084,6 +1094,152 @@ def main():
     check("用户显式设 0 保留", ac2.config["scan_auto_stop"] == 0,
           str(ac2.config["scan_auto_stop"]))
     AC.CONFIG_FILE.unlink()
+
+    # ---- 握手包库: 右键删除/清空/加入跑包界面 ----
+    section("握手包库删除/清空/批量加入")
+    import glob as _glob
+    from PyQt5.QtWidgets import QMenu as _QMenu, QMessageBox as _QMB
+    cday = w.core._dated_dir(); cday.mkdir(parents=True, exist_ok=True)
+    for f in cday.glob("handshake*.cap"):
+        f.unlink()
+    mcaps = []
+    for i, n in enumerate(("handshake-01.cap", "handshake-02.cap"), 1):
+        cp = cday / n
+        cp.write_bytes(b"\x00" * 2048)
+        mcaps.append(cp)
+        w.core.set_cap_meta(cp, {"essid": f"Net-{i}",
+                                 "bssid": f"AA:00:00:00:00:0{i}",
+                                 "channel": "6"})
+    w._refresh_cap_tree()
+    check("握手包已入库", w.cap_tree.topLevelItemCount() == 1,
+          str(w.cap_tree.topLevelItemCount()))
+    top = w.cap_tree.topLevelItem(0)
+    check("库内两个包", top.childCount() == 2, str(top.childCount()))
+
+    # QMenu 必须可用: 之前 main.py 没 import QMenu, 右键直接 NameError,
+    # 菜单根本不弹 —— 这就是"无法删除和清空"的真正原因
+    import main as _M
+    from PyQt5.QtCore import Qt as _Qt
+    check("QMenu 已导入(main 模块可用)", _M.QMenu is not None)
+
+    # 1) 未选中直接右键 -> 应自动选中并删除该包
+    w.cap_tree.clearSelection()
+    tgt = top.child(1)
+    tname = tgt.data(0, _Qt.UserRole)
+    _orig_exec = _QMenu.exec_
+    _QMenu.exec_ = lambda self, *a: self.actions()[0]      # "删除选中"
+    _orig_q = _QMB.question
+    _QMB.question = staticmethod(lambda *a, **k: _QMB.Yes)
+    try:
+        w._cap_menu(w.cap_tree.visualItemRect(tgt).center())
+    finally:
+        _QMB.question = _orig_q
+    check("右键即删(无需先左键)", not Path(tname).exists(), tname)
+
+    # 2) 选中日期行 -> 应展开成该日期下的包, 且必须是真实文件
+    w.cap_tree.clearSelection()
+    w.cap_tree.topLevelItem(0).setSelected(True)
+    sel = w._selected_caps()
+    check("日期行展开为包", len(sel) == 1, str([p.name for p in sel]))
+    check("不含日期目录", all(p.is_file() for p in sel),
+          str([str(p) for p in sel]))
+
+    # 3) 批量加入跑包界面 -> SSID/BSSID 取自 .meta, 不是文件名
+    # 注意: QTabWidget.addTab 只有在标签栏为空时才切换当前标签,
+    # 这里必须显式 setCurrentIndex, 否则写入的是别的(历史恢复的)标签
+    _new_idx = w.result_tabs.addTab(U.CrackResultWidget(), "2030-01-01")
+    w.result_tabs.setCurrentIndex(_new_idx)
+    rtree = w._current_result_tree()
+    check("新建标签已切换为当前", rtree is w.result_tabs.widget(_new_idx))
+    w.cap_tree.clearSelection()
+    w.cap_tree.topLevelItem(0).child(0).setSelected(True)
+    w._batch_add_to_crack()
+    check("已加入结果列表", rtree.topLevelItemCount() == 1,
+          str(rtree.topLevelItemCount()))
+    it0 = rtree.topLevelItem(0)
+    check("SSID 取自抓包元数据", it0.text(rtree.COL_ESSID).startswith("Net-"),
+          it0.text(rtree.COL_ESSID))
+    check("BSSID 取自抓包元数据", it0.text(rtree.COL_BSSID).startswith("AA:"),
+          it0.text(rtree.COL_BSSID))
+    # 重复加入不产生重复行
+    w._batch_add_to_crack()
+    check("重复加入已去重", rtree.topLevelItemCount() == 1,
+          str(rtree.topLevelItemCount()))
+    # 破解出密码后复制应拿到真实 SSID
+    it0.setText(rtree.COL_PWD, "pw123")
+    rtree.setCurrentItem(it0)
+    w.btn_copy_wifi.setEnabled(True)
+    w._copy_wifi_credentials()
+    got = QApplication.clipboard().text()
+    check("复制WiFi含真实SSID",
+          got.startswith(f"WIFI:S:{it0.text(rtree.COL_ESSID)};") and "pw123" in got,
+          got)
+
+    # 4) 清空全部
+    _QMB.question = staticmethod(lambda *a, **k: _QMB.Yes)
+    try:
+        w._clear_all_caps()
+    finally:
+        _QMB.question = _orig_q
+        _QMenu.exec_ = _orig_exec
+    left = _glob.glob(str(cday / "handshake*.cap"))
+    check("清空全部生效", not left, str(left))
+    check("清空后树已刷新", w.cap_tree.topLevelItemCount() == 0,
+          str(w.cap_tree.topLevelItemCount()))
+
+    # ---- 握手包库健壮性: 空项 / 已销毁对象不得崩溃 ----
+    section("握手包库空项与已销毁对象")
+    from PyQt5.QtWidgets import QMenu as _QMenu2
+    check("QMenu 已在 main 中导入", getattr(sys.modules.get("main"), "QMenu", None)
+          is _QMenu2)
+    check("双击空项不崩溃", _call(lambda: w._on_cap_double_clicked(None, 0)))
+    check("备注编辑空项不崩溃", _call(lambda: w._on_cap_note_edited(None, 0)))
+    check("备注编辑其它列忽略", _call(lambda: w._on_cap_note_edited(None, 1)))
+
+    _cd2 = w.core._dated_dir(); _cd2.mkdir(parents=True, exist_ok=True)
+    _cp = _cd2 / "handshake-99.cap"
+    _cp.write_bytes(b"\x00" * 100)
+    w.core.set_cap_meta(_cp, {"essid": "S", "bssid": "AA:1", "channel": "6"})
+    w._refresh_cap_tree()
+    _child = w.cap_tree.topLevelItem(0).child(0)
+    _top = w.cap_tree.topLevelItem(0)
+    w.cap_tree.clear()          # 销毁全部 item
+    check("销毁后双击子项不崩溃",
+          _call(lambda: w._on_cap_double_clicked(_child, 0)))
+    check("销毁后双击分组不崩溃",
+          _call(lambda: w._on_cap_double_clicked(_top, 0)))
+    check("销毁后备注编辑不崩溃",
+          _call(lambda: w._on_cap_note_edited(_child, 0)))
+    check("刷新树恢复正常", _call(w._refresh_cap_tree))
+    _cp.unlink()
+    Path(str(_cp) + ".meta").unlink(missing_ok=True)
+
+    # ---- 边界输入 ----
+    section("边界输入")
+    check("空 CSV", w._parse_ap_csv("", {}) == [])
+    check("仅表头", w._parse_ap_csv(
+        "BSSID,First time seen,Last time seen,channel,Speed,Signal,"
+        "Channel,Radio,Author,Privacy,WPA,Mode,Station count,"
+        "Probed ESSIDs,Lens,Sleep,CC,Rates(dBm1-2),"
+        "Default Rates(dBm1-2),RetRates(dBm1-2),WPS\n", {}) == [])
+    check("垃圾数据", w._parse_ap_csv("garbage\n,,\nnot,a,mac\n", {}) == [])
+    check("Station 段空", w._parse_station_section("") == {})
+    check("Station 段全垃圾", w._parse_station_section("1,2,3\nxx,yy,zz\n") == {})
+    st = w._parse_station_section(
+        "Station MAC, First time seen, Last time seen, Power, # packets,"
+        " BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, t1, t2, -74, 1, AA:BB:CC:DD:EE:FF,\r\n"
+        "(not associated), t1, t2, -70, 1, , \r\n")
+    check("未关联客户端被排除", list(st) == ["AA:BB:CC:DD:EE:FF"], str(st))
+    check("信号越界不崩溃", isinstance(w._signal_bar(-999), tuple))
+    check("信号 None 不崩溃", isinstance(w._signal_bar(None), tuple))
+    check("不存在路径 meta", w.core.cap_meta(Path("/不存在/x.cap")) == {})
+    check("垃圾 meta 不崩溃",
+          _call(lambda: (Path("/tmp/bad3.meta").write_text("{oops"),
+                         w.core.cap_meta(Path("/tmp/bad3.meta")))[1]))
+    check("NaN meta 不崩溃",
+          _call(lambda: (Path("/tmp/bad4.meta").write_text('{"essid": NaN}'),
+                         w.core.cap_meta(Path("/tmp/bad4.meta")))[1]))
 
     section("关闭时清理线程")
     w2.close()

@@ -11,7 +11,9 @@ import subprocess
 import csv as csvmod
 from pathlib import Path
 from typing import Optional
-from PyQt5.QtWidgets import QApplication, QMessageBox, QTableWidgetItem, QFileDialog, QInputDialog, QTreeWidgetItem
+from PyQt5.QtWidgets import (QApplication, QMessageBox, QTableWidgetItem,
+                             QFileDialog, QInputDialog, QTreeWidgetItem,
+                             QMenu)
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QFont, QColor
 
@@ -104,6 +106,7 @@ class EasyAirApp(MainUI):
         self.scan_deadline = None
         self._cd_anchor_left = 0
         self._last_clock_text = ""
+        self._refreshing_caps = False
         self._stopping_scan = False
         self._crack_running = False
         self._scan_warned = False
@@ -517,6 +520,12 @@ class EasyAirApp(MainUI):
     def _cap_menu(self, pos):
         """握手包库右键菜单: 删除 / 清空。"""
         item = self.cap_tree.itemAt(pos)
+        # 关键: 右键不会自动改变选中项。之前直接取 selectedItems(), 用户
+        # 右键点了某个包但没先左键选中时, 选中集是空的 -> 删除/加入都无反应。
+        if item is not None and item not in self.cap_tree.selectedItems():
+            self.cap_tree.setCurrentItem(item)
+            self.cap_tree.clearSelection()
+            item.setSelected(True)
         menu = QMenu(self)
         act_del = menu.addAction("🗑 删除选中")
         act_clear = menu.addAction("🧹 清空全部")
@@ -535,11 +544,25 @@ class EasyAirApp(MainUI):
             self._clear_all_caps()
 
     def _selected_caps(self) -> list:
-        out = []
+        """取选中的握手包文件。
+
+        顶层是"日期"分组, 它的 UserRole 存的是日期字符串(如 2026-10-06),
+        直接当路径会导致 unlink 目录报 IsADirectoryError —— 表现就是
+        选中日期行后删除无效。因此只取叶子项; 选中日期行则展开成
+        该日期下的全部握手包(符合直觉)。"""
+        out, seen = [], set()
         for it in self.cap_tree.selectedItems():
-            v = it.data(0, Qt.UserRole)
-            if v:
-                out.append(Path(v))
+            targets = ([it] if it.parent() is not None
+                       else [it.child(i) for i in range(it.childCount())])
+            for node in targets:
+                v = node.data(0, Qt.UserRole)
+                if not v:
+                    continue
+                p = Path(v)
+                # 双保险: 必须是真实存在的文件, 不能是日期目录
+                if p.is_file() and p not in seen:
+                    seen.add(p)
+                    out.append(p)
         return out
 
     def _delete_selected_caps(self):
@@ -557,6 +580,7 @@ class EasyAirApp(MainUI):
             try:
                 c.unlink(missing_ok=True)
                 Path(str(c) + ".note").unlink(missing_ok=True)
+                Path(str(c) + ".meta").unlink(missing_ok=True)
                 n += 1
             except OSError as e:
                 self.log(f"[删除失败] {c.name}: {e}")
@@ -598,11 +622,28 @@ class EasyAirApp(MainUI):
                 "请先在下方「握手包库」中按住 Ctrl 或 Shift 多选要破解的握手包")
             return
         tree = self._current_result_tree()
+        if tree is None:
+            QMessageBox.information(self, "提示", "请先打开一个破解结果标签页")
+            return
         added = 0
+        # 已在列表里的(同路径)不重复加入
+        existing = set()
+        for i in range(tree.topLevelItemCount()):
+            existing.add(tree.topLevelItem(i).text(tree.COL_CAP))
         for cap in caps:
+            if str(cap) in existing:
+                continue
+            meta = self.core.cap_meta(cap)
+            # 抓包时没记下信息的老包, 退化成用文件名, 至少列里能看到东西
+            essid = meta.get("essid") or cap.stem
+            bssid = meta.get("bssid") or "-"
             note = self.core.cap_note(cap)
-            tree.add_target(cap.stem, "", str(cap), note)
+            tree.add_target(bssid, essid, str(cap), note)
+            existing.add(str(cap))
             added += 1
+        if not added:
+            self.set_status("选中的握手包都已在破解列表里了")
+            return
         idx = self.result_tabs.currentIndex()
         if idx >= 0:
             self.result_tabs.setTabText(
@@ -697,6 +738,13 @@ class EasyAirApp(MainUI):
 
     # ===== 握手包库 =====
     def _refresh_cap_tree(self):
+        self._refreshing_caps = True
+        try:
+            self._rebuild_cap_tree()
+        finally:
+            self._refreshing_caps = False
+
+    def _rebuild_cap_tree(self):
         self.cap_tree.clear()
         groups = {}
         for day, path, size in self.core.list_handshakes():
@@ -732,23 +780,39 @@ class EasyAirApp(MainUI):
         item.setFlags(item.flags() | Qt.ItemIsEditable)
 
     def _on_cap_note_edited(self, item, column):
-        if column != 0:
+        if column != 0 or item is None:
             return
-        path = item.data(0, Qt.UserRole)
-        if not path:
+        # 刷新握手包树会 clear() 掉全部 item, 但已排队的 itemChanged
+        # 仍会送达这里, 此时访问 item 会抛 RuntimeError(C++ 对象已删除)。
+        # 刷新期间直接忽略即可, 备注已经在 _refresh_cap_tree 里写过。
+        if getattr(self, "_refreshing_caps", False):
             return
-        text = item.text(0)
-        note = text.split("  ·  ")[1].strip() if "  ·  " in text else ""
-        self.core.set_cap_note(Path(path), note)
-        self._apply_cap_note(item, note)
+        try:
+            path = item.data(0, Qt.UserRole)
+            if not path:
+                return
+            text = item.text(0)
+            note = text.split("  ·  ")[1].strip() if "  ·  " in text else ""
+            self.core.set_cap_note(Path(path), note)
+            self._apply_cap_note(item, note)
+        except RuntimeError:
+            return
 
     def _on_cap_selected(self):
         self._sync_record_buttons()
 
     def _on_cap_double_clicked(self, item, _col):
-        cap = item.data(0, Qt.UserRole)
+        if item is None:
+            return
+        try:
+            cap = item.data(0, Qt.UserRole)
+        except RuntimeError:
+            return          # 树已刷新, 这个 item 的 C++ 对象已被销毁
         if not cap:
-            self.cap_tree.collapseItem(item)
+            try:
+                self.cap_tree.collapseItem(item)
+            except RuntimeError:
+                pass
             return
         self.lbl_handshake.setText(Path(cap).name)
         self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
@@ -1282,6 +1346,14 @@ class EasyAirApp(MainUI):
                 self.mon_iface, bssid, ch, "handshake")
             if not proc:
                 return None
+            # 记下这个包属于哪个 AP: .cap 本身不含可读的 SSID,
+            # 而加入破解列表/复制 WiFi 都要用 SSID
+            self._cap_essid = essid
+            self._cap_bssid = bssid
+            self._cap_ch = ch
+            for f in sorted(self.core._dated_dir().glob("handshake*.cap")):
+                self.core.set_cap_meta(
+                    f, {"essid": essid, "bssid": bssid, "channel": ch})
             # 等 airodump 完成握手再发 deauth
             time.sleep(2.0)
             dp = self.core.deauth(self.mon_iface, bssid, 10)

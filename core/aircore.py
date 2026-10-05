@@ -418,6 +418,26 @@ class AirCore:
         cmd = f"airodump-ng {mon_iface} --write-interval 1 --output-format csv -w {outpath}"
         return self.run_cmd(cmd, sudo=True)
 
+    def cap_meta(self, cap: Path) -> dict:
+        """读取抓包时记录的 AP 信息(ESSID/BSSID/信道)。
+
+        .cap 文件本身不直接可读地存着 SSID, 而加入破解列表和"复制 WiFi"
+        都需要 SSID, 所以抓包时把目标信息写进同名 .meta 旁文件。
+        老包没有该文件时返回空 dict, 调用方需回退到文件名。"""
+        try:
+            return json.loads(
+                Path(str(cap) + ".meta").read_text(
+                    encoding="utf-8", errors="ignore")) or {}
+        except (OSError, ValueError):
+            return {}
+
+    def set_cap_meta(self, cap: Path, meta: dict):
+        try:
+            Path(str(cap) + ".meta").write_text(
+                json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            print(f"[抓包信息保存失败] {e}")
+
     def cap_note(self, cap: Path) -> str:
         """读取握手包备注(存在同名 .note 旁文件, 不污染 .cap)。"""
         try:
