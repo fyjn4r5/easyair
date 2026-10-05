@@ -93,7 +93,14 @@ class EasyAirApp(MainUI):
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self._parse_scan_csv)
         self.scan_timer.setInterval(1500)
-        self.scan_start_time = time.time()
+        # 倒计时/时长用独立的高频定时器: 解析 CSV 可能因文件被写占用
+        # 而变慢甚至卡住, 倒计时不能跟着一起停(看起来就是"倒计时不连续")
+        self.tick_timer = QTimer(self)
+        self.tick_timer.timeout.connect(self._tick_scan_clock)
+        self.tick_timer.setInterval(200)
+        # 未扫描时必须为 0: 之前用 time.time() 会让"扫描时长"显示成
+        # 几万小时, 且 -1 未知信号判断等判断全部失效
+        self.scan_start_time = 0.0
         self.scan_deadline = None
         self._stopping_scan = False
         self._crack_running = False
@@ -126,6 +133,8 @@ class EasyAirApp(MainUI):
         wait(2000) 等线程, 会让窗口长时间"未响应"甚至被强杀。
         现在: 先停子进程(有界等待), 监听接口交给后台线程收尾,
         残留的 mon 接口下次启动时 _cleanup_monitor 会清理。"""
+        self.tick_timer.stop()
+        self.scan_timer.stop()
         try:
             self._persist_record()
         except Exception as e:  # noqa: BLE001
@@ -819,6 +828,9 @@ class EasyAirApp(MainUI):
         self._scan_warned = False
         self.scan_deadline = (time.time() + self.scan_auto_stop
                                if self.scan_auto_stop > 0 else None)
+        self._autostop_firing = False
+        self.tick_timer.start()
+        self.scan_elapsed.setText(self._scan_elapsed_text())
         if self.scan_deadline:
             self.log(f"[扫描] 将在 {self.scan_auto_stop} 秒后自动停止")
         else:
@@ -907,8 +919,12 @@ class EasyAirApp(MainUI):
             return ""
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
         if self.scan_deadline:
-            left = int(self.scan_deadline - time.time())
-            base += f" | {left}s 后自动停止" if left > 0 else " | 即将停止"
+            left = self.scan_deadline - time.time()
+            if left <= 0:
+                base += " | 即将停止"
+            else:
+                # 向上取整: 否则 44.9s 会显示 44, 造成读数忽大忽小
+                base += f" | {int(left + 0.999)}s 后自动停止"
         return base
 
     def _stop_scan(self):
@@ -920,6 +936,7 @@ class EasyAirApp(MainUI):
                 self.scan_thread.stop()
                 self.scan_thread = None
             self.scan_timer.stop()
+            self.tick_timer.stop()
             self.scan_deadline = None
             self.scan_start_time = 0.0
             self.scan_elapsed.setText("")
@@ -979,36 +996,49 @@ class EasyAirApp(MainUI):
             stations_by_bssid = self._parse_station_section(station_sec)
             rows = self._parse_ap_csv(ap_sec, stations_by_bssid)
             if rows:
+                # setUpdatesEnabled(False) 必须配 finally 恢复, 否则刷新
+                # 表格过程中一旦抛异常, 表格会永久停止重绘 —— 表现就是
+                # 界面卡住甚至随窗口关闭而崩溃。
                 self.ap_table.setUpdatesEnabled(False)
-                self.ap_table.setRowCount(len(rows))
-                for i, r in enumerate(rows):
-                    # r = (信号数值, SSID, 客户端, BSSID, 信道, 加密, 强度, 客户端数)
-                    pwr_int = r[0]
-                    cli_count = r[7]
-                    for col, val in ((1, r[1]), (2, r[2]), (3, r[3]),
-                                     (4, r[4]), (5, r[5]), (6, r[6])):
-                        it = QTableWidgetItem(val)
-                        if col in (1, 3):
-                            it.setToolTip(val)
-                        if col == 2:
-                            it.setForeground(QColor("#1565c0") if cli_count
-                                            else QColor("#b0bec5"))
-                            it.setToolTip(self._client_tips.get(r[3], val))
-                        self.ap_table.setItem(i, col, it)
-                    bar, color = self._signal_bar(pwr_int)
-                    it = QTableWidgetItem(bar)
-                    it.setTextAlignment(Qt.AlignCenter)
-                    it.setForeground(QColor(color))
-                    self.ap_table.setItem(i, 0, it)
-                self.ap_table.setUpdatesEnabled(True)
+                try:
+                    self._fill_ap_table(rows)
+                finally:
+                    self.ap_table.setUpdatesEnabled(True)
                 self.scan_elapsed.setText(self._scan_elapsed_text())
-                n_cli = sum(1 for r in rows if r[8])
+                n_cli = sum(1 for r in rows if r[7])
                 tip = f", {n_cli} 个有客户端" if n_cli else ""
                 n_hid = getattr(self, "_hidden_ssids", 0)
                 htip = f" · 已隐藏 {n_hid} 个隐藏SSID" if n_hid else ""
                 self.set_status(f"发现 {len(rows)} 个 AP{tip}{htip} - 点击选择目标")
-        except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
-            self.log(f"[解析失败] {e}")
+        except Exception as e:  # noqa: BLE001
+            # 定时器槽里的异常只会被 PyQt 打印到控制台, 界面上看不出哪里错了。
+            # 必须留完整栈, 否则"扫描中途闪退/状态不动"无从排查。
+            self.log(f"[解析失败] {type(e).__name__}: {e}")
+            import traceback
+            self.log(traceback.format_exc().strip().replace("\n", " | "))
+
+    def _fill_ap_table(self, rows):
+        """把解析好的 AP 行写入表格(调用方负责 setUpdatesEnabled)。"""
+        self.ap_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            # r = (信号数值, SSID, 客户端, BSSID, 信道, 加密, 强度, 客户端数)
+            pwr_int = r[0]
+            cli_count = r[7]
+            for col, val in ((1, r[1]), (2, r[2]), (3, r[3]),
+                             (4, r[4]), (5, r[5]), (6, r[6])):
+                it = QTableWidgetItem(val)
+                if col in (1, 3):
+                    it.setToolTip(val)
+                if col == 2:
+                    it.setForeground(QColor("#1565c0") if cli_count
+                                    else QColor("#b0bec5"))
+                    it.setToolTip(self._client_tips.get(r[3], val))
+                self.ap_table.setItem(i, col, it)
+            bar, color = self._signal_bar(pwr_int)
+            it = QTableWidgetItem(bar)
+            it.setTextAlignment(Qt.AlignCenter)
+            it.setForeground(QColor(color))
+            self.ap_table.setItem(i, 0, it)
 
     # airodump-ng 的 CSV 表头随版本变化, 必须按列名映射而不是固定下标。
     # 1.6 实测表头: BSSID, First time seen, Last time seen, channel, Speed,
@@ -1443,6 +1473,22 @@ class EasyAirApp(MainUI):
             tree.update_progress(self.current_crack_item, None, elapsed)
             if time.time() - self._last_persist >= 5.0:
                 self._persist_record()
+
+    def _tick_scan_clock(self):
+        """仅刷新时长与倒计时(200ms), 不做任何解析或 IO。
+
+        计时基于 time.time() 差值而非累加, 因此即使个别 tick 被拖慢
+        或丢失, 下一帧会自动校正, 不会越走越偏或出现跳秒。
+        """
+        if not self.scan_start_time:
+            return
+        self.scan_elapsed.setText(self._scan_elapsed_text())
+        if self.scan_deadline and time.time() >= self.scan_deadline:
+            # 本槽每 200ms 进一次, 不置位会重复触发停止流程
+            if getattr(self, "_autostop_firing", False):
+                return
+            self._autostop_firing = True
+            self._stop_scan()
 
     def _format_elapsed(self, start):
         elapsed = max(0, int(time.time() - start))

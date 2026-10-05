@@ -57,7 +57,7 @@ class AirCore:
             "use_gpu": True,
             "hashcat_extra_args": "",
             "auto_monitor": True,
-            "scan_auto_stop": 0,
+            "scan_auto_stop": 45,
             "hashcat_temp_limit": 85,
             "crack_engine": "Hashcat (GPU/CPU)",
             "crack_device": "GPU + CPU (自动)",

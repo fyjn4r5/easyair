@@ -247,7 +247,16 @@ def main():
     check("隐藏 SSID 被计数", getattr(w, "_hidden_ssids", 0) == 1,
           str(getattr(w, "_hidden_ssids", 0)))
     check("状态栏已刷新", w.status_label.text() != "", w.status_label.text())
-    check("扫描时长标签有内容", "扫描时长" in w.scan_elapsed.text(), w.scan_elapsed.text())
+    # 未开始扫描时不应该显示时长(之前用 time.time() 当起点会显示几万小时)
+    check("未扫描时时长为空", w.scan_elapsed.text() == "", w.scan_elapsed.text())
+    # 扫描中: 解析 CSV 会刷新时长
+    w.scan_start_time = time.time() - 7.4
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    check("扫描中时长刷新", "扫描时长" in w.scan_elapsed.text(), w.scan_elapsed.text())
+    check("时长数值连续", "00:00:07" in w.scan_elapsed.text(), w.scan_elapsed.text())
+    w.scan_start_time = 0.0
+    w.scan_elapsed.setText("")
 
     section("AP 选中目标")
     w.ap_table.selectRow(0)
@@ -943,6 +952,76 @@ def main():
     check("先开 airodump 后 deauth", order_seq == ["airodump", "deauth"],
           str(order_seq))
     w.set_scan_status("idle")
+
+    # ---- 倒计时连续性(用户报告"倒计时不连续/中途闪退") ----
+    section("倒计时连续性与表格重绘")
+    w.scan_start_time = time.time()
+    w.scan_deadline = time.time() + 30
+    w.scan_auto_stop = 30
+    w._autostop_firing = False
+    w.scan_timer.stop()
+    w.tick_timer.start()
+    check("tick 定时器 200ms", w.tick_timer.interval() == 200,
+          str(w.tick_timer.interval()))
+    samples = []
+    t0 = time.time()
+    while time.time() - t0 < 1.1:
+        app.processEvents()
+        samples.append((time.time() - t0, w.scan_elapsed.text()))
+        time.sleep(0.05)
+    w.tick_timer.stop()
+    texts = [t for _, t in samples if t]
+    check("倒计时持续刷新", len(texts) >= 4, f"{len(texts)} 次/{len(samples)} 采样")
+    # 间隔不应出现大空洞(不连续)
+    stamps = [ts for ts, t in samples if t]
+    gaps = [round(b - a, 3) for a, b in zip(stamps, stamps[1:])]
+    check("刷新无大间隔", not gaps or max(gaps) < 0.45, str(gaps[:8]))
+    # 倒计时单调递减, 不回跳
+    nums = [int(t.split("|")[1].split("s")[0].strip())
+            for t in texts if "|" in t and "s 后" in t]
+    check("倒计时单调递减", all(a >= b for a, b in zip(nums, nums[1:])),
+          str(nums[:8]))
+    check("倒计时不闪跳(跨度<=1)", (max(nums) - min(nums)) <= 1 if nums else False,
+          str(nums[:8]))
+
+    # 未扫描时计时器必须不启动, 且标签为空
+    w.scan_start_time = 0.0
+    w.scan_deadline = None
+    w.scan_elapsed.setText("")
+    w._tick_scan_clock()
+    check("未扫描时 tick 空转安全", w.scan_elapsed.text() == "",
+          w.scan_elapsed.text())
+
+    # 倒计时到点只触发一次自动停止(防重入)
+    calls = []
+    w.scan_start_time = time.time()
+    w.scan_deadline = time.time() - 1
+    w._autostop_firing = False
+    w._stop_scan = lambda: calls.append(1)
+    for _ in range(6):
+        w._tick_scan_clock()
+    check("自动停止只触发一次", len(calls) == 1, str(len(calls)))
+    w.scan_start_time = 0.0
+    w.scan_deadline = None
+
+    # 刷新表格中途抛异常后必须恢复重绘, 否则界面永久卡死
+    w.ap_table.setUpdatesEnabled(False)
+    try:
+        raise RuntimeError("模拟填充异常")
+    except RuntimeError:
+        pass
+    finally:
+        w.ap_table.setUpdatesEnabled(True)
+    check("异常后表格重绘已恢复", w.ap_table.updatesEnabled())
+
+    # _fill_ap_table 正常路径可用
+    w.ap_table.setRowCount(0)
+    w._fill_ap_table([(-40, "S1", "2 台", "AA:BB:CC:DD:EE:01", "6", "WPA2",
+                       "-40 dBm", 2)])
+    check("_fill_ap_table 填充成功", w.ap_table.rowCount() == 1
+          and w.ap_table.item(0, 1).text() == "S1",
+          f"{w.ap_table.rowCount()} 行")
+    w.ap_table.setRowCount(0)
 
     section("关闭时清理线程")
     w2.close()
