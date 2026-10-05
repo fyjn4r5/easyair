@@ -1240,8 +1240,9 @@ class EasyAirApp(MainUI):
                 macs = ", ".join(c["mac"] for c in clients[:4])
                 if client_count > 4:
                     macs += f" 等{client_count}个"
-                client_str = f"{client_count} 台"
-                client_tip = macs
+                # 列宽 23px 放不下"N 台", 只显示数字, 详情走 tooltip
+                client_str = str(client_count)
+                client_tip = f"{client_count} 台在线客户端: {macs}"
             else:
                 client_str = "-"
                 client_tip = "无在线客户端"

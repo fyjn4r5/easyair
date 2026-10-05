@@ -639,7 +639,8 @@ def main():
     check("AP 表为 7 列", w.ap_table.columnCount() == 7, str(w.ap_table.columnCount()))
     col_hdr = [w.ap_table.horizontalHeaderItem(i).text()
                for i in range(w.ap_table.columnCount())]
-    check("客户端列紧跟 SSID", col_hdr[2] == "客户端", str(col_hdr))
+    # 列宽 23px 放不下"客户端"(需42px), 表头缩写为"端"
+    check("客户端列紧跟 SSID(表头缩写 端)", col_hdr[2] == "端", str(col_hdr))
     check("列宽合计不超过左栏",
           sum(w.ap_table.columnWidth(i) for i in range(7)) <= 660,
           str(sum(w.ap_table.columnWidth(i) for i in range(7))))
@@ -661,7 +662,8 @@ def main():
     w._parse_scan_csv(force=True)
     cells = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).text()
              for r in range(w.ap_table.rowCount())}
-    check("有客户端的 AP 显示数量", cells.get("WithCli", "") == "2 台", str(cells))
+    # 23px 列放不下"N 台", 只显示数字, 详情在 tooltip
+    check("有客户端的 AP 显示数量", cells.get("WithCli", "") == "2", str(cells))
     check("无客户端显示短横", cells.get("NoCli", "") == "-", str(cells))
     tipmap = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).toolTip()
               for r in range(w.ap_table.rowCount())}
@@ -1240,6 +1242,62 @@ def main():
     check("NaN meta 不崩溃",
           _call(lambda: (Path("/tmp/bad4.meta").write_text('{"essid": NaN}'),
                          w.core.cap_meta(Path("/tmp/bad4.meta")))[1]))
+
+    # ---- AP 表列宽 ----
+    section("AP 表列宽")
+    from PyQt5.QtGui import QFontMetrics as _FM
+    t = w.ap_table
+    fm = _FM(t.font())
+    widths = [t.columnWidth(i) for i in range(7)]
+    check("客户端列为原宽 92 的 1/4", widths[2] == 23, str(widths[2]))
+    check("BSSID 刚好容纳一个 MAC",
+          widths[3] >= fm.horizontalAdvance("AA:BB:CC:DD:EE:FF"),
+          f"{widths[3]} >= {fm.horizontalAdvance('AA:BB:CC:DD:EE:FF')}")
+    check("BSSID 比原来 150 更窄", widths[3] < 150, str(widths[3]))
+    check("端列表头缩写放得下",
+          widths[2] >= fm.horizontalAdvance("端"),
+          f"{widths[2]} >= {fm.horizontalAdvance('端')}")
+    check("信号列放得下表头", widths[0] >= fm.horizontalAdvance("信号"))
+    # 注意: 前面有测试把信号列改成 77(模拟用户拖动), 因此这里不能用
+    # 602 这个绝对值; 只校验本次关心的两列宽度, 且总宽不应超出左栏上限。
+    check("总宽不超左栏上限", sum(widths) <= 660, str(sum(widths)))
+    # 表头下限必须调低, 否则 setColumnWidth(23) 会被抬回 57
+    check("表头最小列宽已调低",
+          t.horizontalHeader().minimumSectionSize() <= 23,
+          str(t.horizontalHeader().minimumSectionSize()))
+    check("表头文案", [t.horizontalHeaderItem(i).text() for i in range(7)]
+          == ["信号", "SSID", "端", "BSSID", "信道", "加密", "强度"],
+          str([t.horizontalHeaderItem(i).text() for i in range(7)]))
+    # 端列内容为纯数字, 详情在 tooltip
+    _cd3 = w.core.caps_dir
+    _cd3.mkdir(parents=True, exist_ok=True)
+    _h = ("BSSID,First time seen,Last time seen,channel,Speed,Signal,"
+          "Channel,Radio,Author,Privacy,WPA,Mode,ESSID,Station count,"
+          "Probed ESSIDs,Lens,Sleep,CC,Rates(dBm1-2),"
+          "Default Rates(dBm1-2),RetRates(dBm1-2),WPS")
+    # 按表头严格对齐: 12=ESSID, 13=Station count
+    (_cd3 / "scan-01.csv").write_text(_h + "\n"
+        "AA:BB:CC:DD:EE:FF,t1,t2,6,130,-40,6,CC,WPA2,WPA2,AES,,Net-A,3,Net-A,"
+        "0,,0,,,,,,,\n"
+        "Station MAC, First time seen, Last time seen, Power, # packets,"
+        " BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88,t1,t2,-74,1,AA:BB:CC:DD:EE:FF,Net-A\r\n"
+        "0E:BE:B2:FD:94:89,t1,t2,-70,1,AA:BB:CC:DD:EE:FF,Net-A\r\n"
+        "0E:BE:B2:FD:94:8A,t1,t2,-68,1,AA:BB:CC:DD:EE:FF,\r\n")
+    t.setRowCount(0)
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    check("按表头名解析出 SSID", t.rowCount() == 1
+          and t.item(0, 1).text() == "Net-A",
+          f"{t.rowCount()} 行 / {t.item(0, 1).text() if t.rowCount() else '-'}")
+    check("MAC 完整 17 字符", len(t.item(0, 3).text()) == 17,
+          t.item(0, 3).text())
+    check("端列为纯数字", t.item(0, 2).text().isdigit(), t.item(0, 2).text())
+    check("端列 tooltip 含客户端数与 MAC",
+          "3 台" in t.item(0, 2).toolTip()
+          and "0E:BE:B2:FD:94:88" in t.item(0, 2).toolTip(),
+          t.item(0, 2).toolTip())
+    (_cd3 / "scan-01.csv").unlink(missing_ok=True)
 
     section("关闭时清理线程")
     w2.close()

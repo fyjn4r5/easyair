@@ -442,15 +442,25 @@ class MainUI(QWidget):
 
         self.ap_table = QTableWidget()
         self.ap_table.setColumnCount(7)
+        # 客户端列按原宽 92 的 1/4 = 23px。实测 23px 放不下"客户端"表头
+        # (需 42px)也放不下"N 台"(需 33px), 因此表头缩写为"端"、内容只显示
+        # 数字, 完整信息(客户端数与 MAC 列表)放在 tooltip 里。
+        # BSSID 130px = 字体实测刚好容纳一个 MAC(AA:BB:CC:DD:EE:FF 需 122px)。
         self.ap_table.setHorizontalHeaderLabels(
-            ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"])
+            ["信号", "SSID", "端", "BSSID", "信道", "加密", "强度"])
         # BSSID/信道/加密 明细对日常使用不是必需, 但抓包要用 BSSID,
         # 因此保留列但收窄, 完整信息通过 tooltip 展示
         ap_header = self.ap_table.horizontalHeader()
         ap_header.setSectionResizeMode(QHeaderView.Interactive)
         ap_header.setStretchLastSection(False)
         ap_header.setHighlightSections(False)
-        for idx, w in enumerate((44, 132, 92, 150, 44, 88, 52)):
+        # 关键: QHeaderView.minimumSectionSize 默认被字体撑到 57px,
+        # 任何小于它的 setColumnWidth 都会被悄悄抬回 57 —— 这就是"端"列
+        # 无论如何都缩不下去的原因。这里显式降到 12px 才能真正收窄。
+        ap_header.setMinimumSectionSize(12)
+        # 信号44 / SSID221 / 端23 / BSSID130 / 信道44 / 加密88 / 强度52 = 602
+        # 总宽与调整前一致; 客户端(92->23)和 BSSID(150->130)省下的宽度给了 SSID
+        for idx, w in enumerate((44, 221, 23, 130, 44, 88, 52)):
             self.ap_table.setColumnWidth(idx, w)
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)
