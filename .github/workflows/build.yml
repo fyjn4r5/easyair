@@ -70,10 +70,8 @@ jobs:
             --hidden-import=PyQt5.QtPrintSupport \
             --hidden-import=PyQt5.sip \
             --hidden-import=psutil \
-            --hidden-import=ui \
-            --hidden-import=ui.main_ui \
-            --hidden-import=core \
-            --hidden-import=core.aircore \
+            --collect-all=ui \
+            --collect-all=core \
             main.py
 
       - name: Verify binary
