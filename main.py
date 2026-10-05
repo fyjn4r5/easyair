@@ -1668,7 +1668,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.12.2"
+VERSION = "1.12.3"
 
 
 def _selftest() -> int:

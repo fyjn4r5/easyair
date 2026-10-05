@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QSystemTrayIcon, QStyle, QApplication, QPlainTextEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
+from PyQt5.QtGui import QFont, QFontMetrics, QColor, QIcon, QPixmap, QPainter
 from pathlib import Path
 
 
@@ -303,7 +303,7 @@ class MainUI(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         # 标题带版本号: 之前多个版本并存, 无法判断跑的是哪个构建
-        ver = "1.12.2"
+        ver = "1.12.3"
         try:
             import main as _m
             ver = getattr(_m, "VERSION", ver)
@@ -445,7 +445,9 @@ class MainUI(QWidget):
         # 客户端列按原宽 92 的 1/4 = 23px。实测 23px 放不下"客户端"表头
         # (需 42px)也放不下"N 台"(需 33px), 因此表头缩写为"端"、内容只显示
         # 数字, 完整信息(客户端数与 MAC 列表)放在 tooltip 里。
-        # BSSID 130px = 字体实测刚好容纳一个 MAC(AA:BB:CC:DD:EE:FF 需 122px)。
+        # BSSID 列宽按当前字体实测, 保证 AA:BB:CC:DD:EE:FF 完整显示:
+        # 不同字体的 MAC 宽度差别很大(Ubuntu 字体约 122px, DejaVu Sans
+        # 12pt 约 166px), 写死像素换台机器就被截断, 因此这里按字体算。
         self.ap_table.setHorizontalHeaderLabels(
             ["信号", "SSID", "端", "BSSID", "信道", "加密", "强度"])
         # BSSID/信道/加密 明细对日常使用不是必需, 但抓包要用 BSSID,
@@ -458,9 +460,14 @@ class MainUI(QWidget):
         # 任何小于它的 setColumnWidth 都会被悄悄抬回 57 —— 这就是"端"列
         # 无论如何都缩不下去的原因。这里显式降到 12px 才能真正收窄。
         ap_header.setMinimumSectionSize(12)
-        # 信号44 / SSID221 / 端23 / BSSID130 / 信道44 / 加密88 / 强度52 = 602
-        # 总宽与调整前一致; 客户端(92->23)和 BSSID(150->130)省下的宽度给了 SSID
-        for idx, w in enumerate((44, 221, 23, 130, 44, 88, 52)):
+        # 信号44 / 端23 / 信道44 / 加密88 / 强度52 固定, 余下在 SSID 与
+        # BSSID 之间分配: BSSID 取"实测 MAC 宽度 + 6px 余量", SSID 拿剩下的,
+        # 两列之和恒为 532, 因此总宽仍为 602, 不改变表格整体占位。
+        _fixed = 44 + 23 + 44 + 88 + 52
+        _bssid = QFontMetrics(self.ap_table.font()).horizontalAdvance(
+            "AA:BB:CC:DD:EE:FF") + 6
+        _ssid = 602 - _fixed - _bssid
+        for idx, w in enumerate((44, _ssid, 23, _bssid, 44, 88, 52)):
             self.ap_table.setColumnWidth(idx, w)
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)

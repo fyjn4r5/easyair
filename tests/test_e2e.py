@@ -1250,10 +1250,14 @@ def main():
     fm = _FM(t.font())
     widths = [t.columnWidth(i) for i in range(7)]
     check("客户端列为原宽 92 的 1/4", widths[2] == 23, str(widths[2]))
-    check("BSSID 刚好容纳一个 MAC",
-          widths[3] >= fm.horizontalAdvance("AA:BB:CC:DD:EE:FF"),
-          f"{widths[3]} >= {fm.horizontalAdvance('AA:BB:CC:DD:EE:FF')}")
-    check("BSSID 比原来 150 更窄", widths[3] < 150, str(widths[3]))
+    _mac_px = fm.horizontalAdvance("AA:BB:CC:DD:EE:FF")
+    # 列宽按字体实测分配, 不能写死像素: Ubuntu 字体一个 MAC 约 122px,
+    # DejaVu Sans 12pt 约 166px, 换字体写死 130 就会截断 BSSID。
+    check("BSSID 刚好容纳一个 MAC", widths[3] >= _mac_px,
+          f"{widths[3]} >= {_mac_px}")
+    check("BSSID 不浪费多余宽度", widths[3] <= _mac_px + 8,
+          f"{widths[3]} <= {_mac_px + 8}")
+    check("SSID 拿到省下的宽度", widths[1] >= 179, str(widths[1]))
     check("端列表头缩写放得下",
           widths[2] >= fm.horizontalAdvance("端"),
           f"{widths[2]} >= {fm.horizontalAdvance('端')}")
