@@ -302,7 +302,14 @@ class MainUI(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("EasyAir - WiFi 抓包破解 (EWSA 风格)")
+        # 标题带版本号: 之前多个版本并存, 无法判断跑的是哪个构建
+        ver = "1.12.2"
+        try:
+            import main as _m
+            ver = getattr(_m, "VERSION", ver)
+        except Exception:  # noqa: BLE001
+            pass
+        self.setWindowTitle(f"EasyAir v{ver} - WiFi 抓包破解")
         self.resize(1400, 850)
         
         self.icon_on = create_status_icon("#2e7d32")

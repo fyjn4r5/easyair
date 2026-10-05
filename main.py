@@ -1667,7 +1667,85 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
+VERSION = "1.12.2"
+
+
+def _selftest() -> int:
+    """离线自检: 不需要真实网卡, 用于验证打包产物是否可运行。
+
+    必须真正 exit, 否则 --selftest 会像普通启动一样进入事件循环,
+    外面只能靠 timeout 杀掉, 退出码毫无意义(之前的"冒烟通过"是假象)。"""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    app.setStyle("Fusion")
+    wins = []
+    ok = True
+
+    def chk(label, cond, extra=""):
+        nonlocal ok
+        print(f"  {'PASS' if cond else 'FAIL'}  {label}" + (f"  {extra}" if extra else ""))
+        if not cond:
+            ok = False
+
+    print(f"EasyAir v{VERSION} 自检")
+    chk("版本号可读", bool(VERSION), VERSION)
+    try:
+        w = EasyAirApp()
+        wins.append(w)
+        chk("主窗口创建", w is not None)
+        chk("配置目录可写", w.core.caps_dir.parent.exists()
+            or w.core.caps_dir.parent.mkdir(parents=True, exist_ok=True) is None)
+        chk("默认扫描时长", w.scan_auto_stop == 45, f"{w.scan_auto_stop} 秒")
+
+        # 倒计时: 模拟 6 秒, 必须严格 1 秒 1 跳
+        w._stop_scan = lambda: None
+        w.scan_timer.stop()
+        w.scan_start_time = time.time()
+        w.scan_deadline = w.scan_start_time + 45
+        w._cd_anchor_left = 45
+        w._last_clock_text = ""
+        w._autostop_firing = False
+        w.tick_timer.start()
+        seen, t0 = [], time.time()
+        while time.time() - t0 < 6:
+            app.processEvents()
+            w._tick_scan_clock()
+            cur = w.scan_elapsed.text()
+            if not seen or seen[-1][1] != cur:
+                seen.append((round(time.time() - t0, 2), cur))
+            time.sleep(0.02)
+        w.tick_timer.stop()
+        nums = []
+        for _, t in seen:
+            if "s 后" in t:
+                nums.append(int(t.split("|")[1].split("s")[0]))
+        uniq = []
+        for n in nums:
+            if not uniq or uniq[-1] != n:
+                uniq.append(n)
+        chk("倒计时逐秒递减", uniq[:5] == [45, 44, 43, 42, 41], str(uniq[:6]))
+        gaps = [round(b[0] - a[0], 2) for a, b in zip(seen, seen[1:]) if "s 后" in b[1]]
+        chk("每格约 1 秒", all(0.9 <= g <= 1.2 for g in gaps), str(gaps))
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print(f"  FAIL  自检异常: {e}")
+        traceback.print_exc()
+        ok = False
+    for w in wins:
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001
+            pass
+    print("自检结果:", "全部通过" if ok else "存在失败项")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(f"EasyAir {VERSION}")
+        sys.exit(0)
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = EasyAirApp()
