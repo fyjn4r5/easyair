@@ -28,6 +28,8 @@ class CmdThread(QThread):
                     break
                 self.line_out.emit(line.rstrip())
             self.proc.wait()
+        except (OSError, ValueError) as e:
+            self.line_out.emit(f"[线程错误] {e}")
         finally:
             self.finished.emit()
 
@@ -36,7 +38,7 @@ class CmdThread(QThread):
         if self.proc:
             try:
                 self.proc.terminate()
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -58,7 +60,6 @@ class EasyAirApp(MainUI):
         self.scan_timer.timeout.connect(self._parse_scan_csv)
         self.scan_timer.setInterval(1500)
 
-        # 破解相关状态
         self.current_crack_item = None
         self.crack_start_time = 0
         self.crack_timer = QTimer(self)
@@ -70,30 +71,17 @@ class EasyAirApp(MainUI):
         self._refresh_ifaces()
 
     def _bind(self):
-        # 网卡
         self.btn_refresh_iface.clicked.connect(self._refresh_ifaces)
-
-        # 监听模式按钮（手动切换）
         self.btn_mon_toggle.toggled.connect(self._on_mon_toggle)
-
-        # 扫描/抓包
         self.btn_scan.clicked.connect(self._start_scan)
         self.btn_stop_scan.clicked.connect(self._stop_scan)
         self.btn_capture.clicked.connect(self._start_capture)
         self.btn_deauth.clicked.connect(self._do_deauth)
-
-        # 字典管理
         self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
-
-        # 破解设置
         self.btn_crack_cfg.clicked.connect(self._open_crack_settings)
-
-        # 破解控制
         self.btn_start_crack.clicked.connect(self._start_crack)
         self.btn_stop_crack.clicked.connect(self._stop_crack)
         self.btn_export.clicked.connect(self._export_results)
-
-        # AP 表格双击选择目标
         self.ap_table.cellDoubleClicked.connect(self._on_ap_double_clicked)
 
     def log(self, txt: str):
@@ -103,7 +91,6 @@ class EasyAirApp(MainUI):
     def set_status(self, txt: str):
         self.status_label.setText(txt)
 
-    # ===== 网卡 =====
     def _refresh_ifaces(self):
         self.iface_combo.clear()
         for i in self.core.list_interfaces():
@@ -113,7 +100,6 @@ class EasyAirApp(MainUI):
             self.log("  - 真机: 确认网卡驱动正常")
             self.log("  - 虚拟机: 需将支持监听的 USB 无线网卡直通")
 
-    # ===== 监听模式手动切换 =====
     def _on_mon_toggle(self, checked: bool):
         physical = self.iface_combo.currentText()
         if not physical:
@@ -133,15 +119,12 @@ class EasyAirApp(MainUI):
             self._stop_monitor_manual()
 
     def _on_mon_started(self, physical: str):
-        """监听模式启动完成，检测实际监听接口"""
-        # 核心修复：优先检查原物理接口是否已变 monitor 模式
         if self.core.check_monitor_mode(physical):
             self.mon_iface = physical
             self.log(f"[就绪] 监听接口: {physical} (原接口直接切换)")
             self.set_monitor_status("on")
             return
 
-        # 兜底：查找名字含 mon 的新接口
         for iface in self.core.list_interfaces():
             if "mon" in iface and physical in iface:
                 if self.core.check_monitor_mode(iface):
@@ -169,9 +152,8 @@ class EasyAirApp(MainUI):
         self.set_monitor_status("off")
         self.btn_mon_toggle.setChecked(False)
 
-    # ===== 字典管理 =====
     def _load_wordlists(self):
-        pass  # 不在主界面显示
+        pass
 
     def _open_dict_manager(self):
         dlg = WordListDialog(self, self.core.get_wordlists())
@@ -209,7 +191,6 @@ class EasyAirApp(MainUI):
             self.core.save_config()
             self.log("[设置] 已保存")
 
-    # ===== 扫描 AP（自动开启监听）=====
     def _start_scan(self):
         physical = self.iface_combo.currentText()
         if not physical:
@@ -230,10 +211,8 @@ class EasyAirApp(MainUI):
         self.btn_stop_scan.setEnabled(True)
 
     def _on_mon_ready_for_scan(self):
-        """监听模式就绪，开始扫描"""
         physical = self.physical_iface
         
-        # 核心修复：优先检查原物理接口
         if self.core.check_monitor_mode(physical):
             self.mon_iface = physical
             self.log(f"[就绪] 监听接口: {physical} (原接口直接切换)")
@@ -241,7 +220,6 @@ class EasyAirApp(MainUI):
             self._do_scan()
             return
 
-        # 兜底：查找名字含 mon 的新接口
         for iface in self.core.list_interfaces():
             if "mon" in iface and physical in iface:
                 if self.core.check_monitor_mode(iface):
@@ -258,7 +236,6 @@ class EasyAirApp(MainUI):
         self.set_status("监听模式开启失败")
 
     def _do_scan(self):
-        """实际开始 airodump-ng 扫描"""
         self.log(f"> 扫描 AP: {self.mon_iface}")
         p = self.core.airodump_scan(self.mon_iface, "scan")
         self.scan_thread = CmdThread(p)
@@ -312,7 +289,7 @@ class EasyAirApp(MainUI):
                         sig = "📶📶"
                     else:
                         sig = "📶"
-                except:
+                except ValueError:
                     sig = "📶"
                 rows.append((sig, essid or "(隐藏)", bssid, ch.strip(), f"{priv}/{cipher}", auth.strip(), pwr))
             if rows:
@@ -324,7 +301,7 @@ class EasyAirApp(MainUI):
                         self.ap_table.setItem(i, c, QTableWidgetItem(v))
                 self.log(f"[解析] 更新 AP 列表: {len(rows)} 个")
                 self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
-        except Exception as e:
+        except (OSError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
     def _on_ap_double_clicked(self, row, col):
@@ -348,7 +325,6 @@ class EasyAirApp(MainUI):
         self.log(f"[目标] 已选择: {essid} ({bssid}) CH:{ch}")
         self.set_status(f"目标已锁定: {essid} - 点击'抓取握手包'")
 
-    # ===== 抓包 =====
     def _start_capture(self):
         essid = self.lbl_target_essid.text()
         bssid = self.lbl_target_bssid.text()
@@ -406,7 +382,6 @@ class EasyAirApp(MainUI):
             t.finished.connect(lambda: setattr(self, 'mon_iface', None))
             t.start()
 
-    # ===== 破解 =====
     def _start_crack(self):
         cap = self.core.get_latest_handshake()
         if not cap:
@@ -532,7 +507,7 @@ class EasyAirApp(MainUI):
                         f.write(f"{item.text(0)},{item.text(1)},{item.text(2)},{item.text(3)},{item.text(4)},{item.text(5)}\n")
                 QMessageBox.information(self, "成功", f"已导出到: {fn}")
                 self.log(f"[导出] 结果已保存到: {fn}")
-            except Exception as e:
+            except OSError as e:
                 QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
