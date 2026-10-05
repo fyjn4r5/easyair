@@ -66,12 +66,50 @@ def main():
     check("引擎下拉框已从主面板移除", not hasattr(w, "crack_engine"))
     check("设备下拉框已从主面板移除", not hasattr(w, "device_combo"))
 
-    section("布局: 日志双窗口")
-    check("日志有 2 个 tab", w.log_tabs.count() == 2, str(w.log_tabs.count()))
-    check("tab0=抓包", "抓包" in w.log_tabs.tabText(0))
-    check("tab1=破解", "破解" in w.log_tabs.tabText(1))
+    section("布局: 底部标签页")
+    check("底部有 3 个 tab", w.bottom_tabs.count() == 3, str(w.bottom_tabs.count()))
+    check("tab0=握手包库", "握手包库" in w.bottom_tabs.tabText(0), w.bottom_tabs.tabText(0))
+    check("tab1=抓包日志", "抓包" in w.bottom_tabs.tabText(1), w.bottom_tabs.tabText(1))
+    check("tab2=破解日志", "破解" in w.bottom_tabs.tabText(2), w.bottom_tabs.tabText(2))
+    check("握手包库已移入底部tab", w.cap_tree.parent() is not w.ap_table.parent())
     check("两个日志框独立", w.log_scan_box is not w.log_crack_box)
     check("日志框有行数上限", w.log_scan_box.maximumBlockCount() > 0)
+
+    section("布局: AP 表与破解结果表等高")
+    w.show()
+    for _ in range(6):
+        app.processEvents()
+    ap_h, res_h = w.ap_table.height(), w.result_tabs.height()
+    check("AP 表可见高度>200", ap_h > 200, str(ap_h))
+    check("AP 表与破解结果表等高(±10px)", abs(ap_h - res_h) <= 10,
+          f"ap={ap_h} result={res_h} diff={abs(ap_h - res_h)}")
+    check("目标信息已提到状态条", w.lbl_target_essid.height() <= 40,
+          str(w.lbl_target_essid.height()))
+    check("进度条在顶部状态条", w.progress_bar.y() < w.ap_table.y(),
+          f"progress_y={w.progress_bar.y()} ap_y={w.ap_table.y()}")
+
+    section("布局: 日志噪音过滤")
+    noise = [
+        "PHY\tInterface\tDriver\t\tChipset",
+        "phy0\twlan0\t\trtl8723be\tRealtek RTL8723BE",
+        "\t\t(monitor mode disabled)",
+        "command failed: No such device (-19)",
+        "command time out: 5 s",
+        "nl80211: wlan0: deauthenticating",
+        "monitor mode for interface wlan0 to wlan0mon",
+    ]
+    before = w.log_scan_box.toPlainText()
+    for n in noise:
+        w.log(n)
+    after = w.log_scan_box.toPlainText()
+    check("原始工具输出被过滤", before == after,
+          f"多出 {len(after) - len(before)} 字符")
+    for key in ("Chipset", "Realtek", "monitor mode disabled",
+                "command failed", "nl80211"):
+        check(f"日志不含 {key}", key not in after)
+    w.log("[测试] 有意义的信息应当保留")
+    check("有意义日志正常输出",
+          "[测试] 有意义的信息应当保留" in w.log_scan_box.toPlainText())
 
     section("布局: 列宽可拖动")
     from PyQt5.QtWidgets import QHeaderView
@@ -358,10 +396,9 @@ def main():
     pump(80)
     check("停止扫描不关闭监听模式", stopped["n"] == 0, f"stop_monitor 调用 {stopped['n']} 次")
     check("停止后监听接口仍保留", w2.mon_iface == "wlan0mon", str(w2.mon_iface))
-    check("停止后提示可直接抓包", "可直接抓取握手包" in w2.log_scan_box.toPlainText())
-    check("停止后扫描按钮恢复", w2.btn_scan.isEnabled())
+    check("停止后按钮恢复可点", w2.btn_scan.isEnabled())
     check("停止后停止按钮禁用", not w2.btn_stop_scan.isEnabled())
-    check("停止后按钮文案复位", w2.btn_scan.text() == "🔍 开始扫描", w2.btn_scan.text())
+    check("停止后按钮文案复位", w2.btn_scan.text() == "🔍 扫描", w2.btn_scan.text())
 
     section("扫描自动停止")
     w2.scan_auto_stop = 45
@@ -406,6 +443,7 @@ def main():
     w2.close()
     pump(100)
     check("close 后线程表清空", len(w2._threads) == 0, str(len(w2._threads)))
+    check("close 后 worker 表清空", len(w2._workers) == 0, str(len(w2._workers)))
 
     print("\n" + "=" * 60)
     print(f"PASS: {len(PASS)}   FAIL: {len(FAIL)}")

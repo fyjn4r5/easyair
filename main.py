@@ -92,7 +92,9 @@ class EasyAirApp(MainUI):
         self.crack_timer.timeout.connect(self._update_crack_timer)
         self.crack_timer.setInterval(1000)
         self._worker = None
+        self._workers = set()
         self._threads = set()
+        self._last_persist = 0.0
 
         self._bind()
         self._load_wordlists()
@@ -102,6 +104,10 @@ class EasyAirApp(MainUI):
         self._refresh_cap_tree()
 
     def closeEvent(self, event):
+        try:
+            self._persist_record()
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] 保存进度失败: {e}")
         if self.mon_iface:
             self.log(f"[退出] 关闭监听模式: {self.mon_iface}")
             try:
@@ -156,16 +162,18 @@ class EasyAirApp(MainUI):
         return thread
 
     def _run_worker(self, fn, on_done=None):
-        """在后台线程执行阻塞函数, 复用前先等上一个 worker 结束"""
-        prev = self._worker
-        if prev is not None and prev.isRunning():
-            if not prev.wait(5000):
-                prev.terminate()
-                prev.wait(1000)
+        """在后台线程执行阻塞函数。
+
+        不要在此等待上一个 worker: 抓握手包期间用户仍要点 Deauth,
+        并发是正常用法; 而 GUI 线程 wait() 会造成最多 5s 的界面假死。
+        这里只保留引用防止 QThread 被过早回收(那会触发
+        "QThread: Destroyed while thread is still running")。"""
         worker = FuncThread(fn)
         if on_done is not None:
             worker.done.connect(on_done)
         self._worker = worker
+        self._workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._workers.discard(w))
         self._track(worker)
         worker.start()
         return worker
@@ -192,11 +200,48 @@ class EasyAirApp(MainUI):
             except RuntimeError:
                 pass
         self._threads.clear()
+        for w in list(self._workers):
+            try:
+                if w.isRunning():
+                    w.wait(2000)
+            except RuntimeError:
+                pass
+        self._workers.clear()
 
     # ===== 日志 =====
+    # 原始工具输出过滤规则: iw/airmon-ng 的表格、"command failed" 噪音
+    _NOISE_PATTERNS = (
+        "command failed", "command time out", "no such device",
+        "\tInterface\tDriver", "PHY\tInterface", "Chipset",
+        "(monitor mode disabled)", "(monitor mode enabled)",
+        "nl80211: ", "--- ", "wlan0mon", "set monitor mode",
+        "monitor mode for interface", "level 2", "level 3",
+    )
+
+    def _should_log(self, txt: str) -> bool:
+        """只保留有信息量的行, 过滤 iw/airmon-ng 原始输出"""
+        s = txt.strip()
+        if not s:
+            return False
+        low = s.lower()
+        for pat in self._NOISE_PATTERNS:
+            if pat.lower() in low:
+                return False
+        # 纯表格行(连续制表符) 与 重复的 --- 分隔线
+        if s.count("\t") >= 2:
+            return False
+        return True
+
     def log(self, txt: str):
-        """抓包/扫描日志"""
+        """抓包/扫描日志 (只收有意义的内容)"""
+        if not self._should_log(txt):
+            return
         self.log_scan_box.appendPlainText(txt)
+
+    def log_scan(self, txt: str):
+        """子进程 stdout 入口 (airdump 等), 过滤噪音但保留扫描输出"""
+        if self._should_log(txt):
+            self.log_scan_box.appendPlainText(txt)
 
     def log_crack(self, txt: str):
         """破解日志"""
@@ -223,10 +268,10 @@ class EasyAirApp(MainUI):
             return
 
         if checked:
-            self.log(f"[手动] 开启监听模式: {physical}")
             self.set_monitor_status("starting")
             self.physical_iface = physical
             self.btn_mon_toggle.setEnabled(False)
+            self.set_status(f"正在开启监听模式 · {physical}")
             self._run_worker(lambda: self.core.start_monitor(physical),
                              self._on_mon_started)
         else:
@@ -252,29 +297,34 @@ class EasyAirApp(MainUI):
     def _apply_mon_iface(self, mon):
         if mon:
             self.mon_iface = mon
-            self.log(f"[就绪] 监听接口: {mon}")
+            self.log(f"监听模式已就绪 · 接口 {mon}")
             self.set_monitor_status("on")
+            self.set_status(f"监听中 · 可直接扫描或抓取握手包")
             return
 
-        self.log("[错误] 监听模式开启失败：未检测到 monitor 接口")
+        self.log("监听模式开启失败 · 未检测到 monitor 接口")
         self.set_monitor_status("error")
         self.btn_mon_toggle.setChecked(False)
+        self.set_status("监听模式开启失败")
 
     def _stop_monitor_manual(self):
         if self.mon_iface:
-            self.log(f"[手动] 关闭监听模式: {self.mon_iface}")
             mon = self.mon_iface
+            self.set_monitor_status("starting")
+            self.set_status("正在关闭监听模式…")
             self._run_worker(lambda: self.core.stop_monitor(mon),
                              self._on_stop_monitor_proc)
 
     def _on_stop_monitor_proc(self, p):
-        self._spawn_cmd(p, self.log, self._on_mon_stopped)
+        self._spawn_cmd(p, self.log_scan, self._on_mon_stopped)
 
     def _on_mon_stopped(self):
         self.mon_iface = None
         self.physical_iface = None
         self.set_monitor_status("off")
         self.btn_mon_toggle.setChecked(False)
+        self.log("监听模式已关闭")
+        self.set_status("监听模式已关闭")
 
     # ===== 字典管理 =====
     def _load_wordlists(self):
@@ -478,7 +528,7 @@ class EasyAirApp(MainUI):
     def _do_scan(self):
         """实际开始 airodump-ng 扫描"""
         self.log(f"> 扫描 AP: {self.mon_iface}")
-        self.btn_scan.setText("🔍 扫描中...")
+        self.btn_scan.setText("⏹ 扫描中")
         self.scan_start_time = time.time()
         self.scan_deadline = (time.time() + self.scan_auto_stop
                                if self.scan_auto_stop > 0 else None)
@@ -494,7 +544,7 @@ class EasyAirApp(MainUI):
 
     def _on_scan_started(self, proc):
         self.scan_thread = self._spawn_cmd(proc, self.log)
-        self.set_status("扫描中... 0s / 0 个 AP")
+        self.set_status("扫描中 · 等待 AP…")
 
     def _scan_elapsed_text(self):
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
@@ -516,12 +566,12 @@ class EasyAirApp(MainUI):
             self._parse_scan_csv(force=True)
             self.btn_scan.setEnabled(True)
             self.btn_stop_scan.setEnabled(False)
-            self.btn_scan.setText("🔍 开始扫描")
+            self.btn_scan.setText("🔍 扫描")
             self.set_scan_status("idle")
             n = self.ap_table.rowCount()
             self.set_status(f"扫描已停止 - 共发现 {n} 个 AP")
             if self.mon_iface:
-                self.log(f"[提示] 监听模式保持开启({self.mon_iface})，可直接抓取握手包")
+                self.log(f"监听模式保持开启 · {self.mon_iface} · 可直接抓取握手包")
             else:
                 self.log("[提示] 监听模式未开启，请点顶部按钮开启后再抓包")
         finally:
@@ -629,27 +679,36 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "提示", "监听模式未就绪")
             return
 
-        self.log(f"[抓包] 目标: {essid} | {bssid} | CH:{ch}")
-        self.log(f"> airodump-ng --bssid {bssid} --channel {ch} -w captures/handshake {self.mon_iface}")
-        p = self.core.airodump_capture(self.mon_iface, bssid, ch, "handshake")
-        self.cap_thread = self._spawn_cmd(p, self.log)
-        
+        self.log(f"[抓包] 目标: {essid} | {bssid} | CH{ch}")
+        self.bottom_tabs.setCurrentWidget(self.log_scan_box)
+        self.set_status("正在抓取握手包… 可点击 Deauth 加速")
+
+        # sudo 校验最长阻塞 5s, 必须放工作线程, 否则界面会假死
+        def _capture():
+            return self.core.airodump_capture(self.mon_iface, bssid, ch, "handshake")
+
+        self._run_worker(_capture, self._on_capture_started)
+
         self.cap_check_timer = QTimer(self)
         self.cap_check_timer.timeout.connect(self._check_handshake)
         self.cap_check_timer.setInterval(2000)
         self.cap_check_timer.start()
-        
-        self.set_status("正在抓取握手包... 可点击 Deauth 加速")
+
+    def _on_capture_started(self, p):
+        if not p:
+            self.set_status("抓包启动失败")
+            return
+        self.cap_thread = self._spawn_cmd(p, self.log_scan)
 
     def _check_handshake(self):
         cap = self.core.get_latest_handshake()
         if cap:
-            self.lbl_handshake.setText(f"已捕获: {cap.name}")
+            self.lbl_handshake.setText(f"握手包 {cap.name}")
             self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
-            self.log(f"[成功] 捕获握手包: {cap}")
-            self.log_tabs.setCurrentIndex(0)
+            self.log(f"[成功] 已捕获握手包 → {cap.name}")
+            self.bottom_tabs.setCurrentWidget(self.log_scan_box)
             self._refresh_cap_tree()
-            self.set_status(f"握手包已捕获: {cap.name} - 可开始破解")
+            self.set_status(f"握手包已捕获 · 可开始破解")
             if hasattr(self, 'cap_check_timer'):
                 self.cap_check_timer.stop()
 
@@ -658,10 +717,21 @@ class EasyAirApp(MainUI):
         if not bssid or bssid == "未选择":
             return
         if not self.mon_iface:
+            self.set_status("监听模式未开启，无法发送 deauth")
             return
-        self.log(f"> aireplay-ng --deauth 10 -a {bssid} {self.mon_iface}")
-        p = self.core.deauth(self.mon_iface, bssid, 10)
-        self.deauth_thread = self._spawn_cmd(p, self.log)
+
+        def _deauth():
+            return self.core.deauth(self.mon_iface, bssid, 10)
+
+        # 同上: sudo 校验会阻塞 GUI
+        self._run_worker(_deauth, self._on_deauth_started)
+
+    def _on_deauth_started(self, p):
+        if not p:
+            self.set_status("Deauth 启动失败")
+            return
+        self.log(f"[deauth] 已发送 10 次解关联 → {self.lbl_target_bssid.text()}")
+        self.deauth_thread = self._spawn_cmd(p, self.log_scan)
 
     def _auto_stop_monitor(self):
         if self.auto_monitor_enabled and self.mon_iface:
@@ -712,7 +782,7 @@ class EasyAirApp(MainUI):
         self.btn_stop_crack.setEnabled(True)
         self.crack_start_time = time.time()
         self.crack_timer.start()
-        self.log_tabs.setCurrentIndex(1)
+        self.bottom_tabs.setCurrentWidget(self.log_crack_box)
 
         engine = self.core.config.get("crack_engine", "Hashcat (GPU/CPU)")
         if engine.startswith("Aircrack"):
@@ -784,19 +854,23 @@ class EasyAirApp(MainUI):
         self._persist_record()
 
     def _persist_record(self):
+        """落盘破解进度。history.json 是整文件读写, 所以由 _update_crack_timer
+        节流到最多每 5s 调一次; 交互操作(备注/开始/结束/退出)直接调用本函数。"""
         tree = getattr(self, 'current_crack_tree', None)
         if not tree or not self.current_crack_item:
             return
+        self._last_persist = time.time()
         index = tree.indexOfTopLevelItem(self.current_crack_item)
         self.core.history_update(self.current_crack_date, index, tree.to_record(self.current_crack_item))
 
     def _update_crack_timer(self):
         elapsed = self._format_elapsed(self.crack_start_time)
-        self.lbl_progress.setText(f"破解中... 已耗时: {elapsed}")
+        self.lbl_progress.setText(f"破解中 · {elapsed}")
         tree = getattr(self, 'current_crack_tree', None)
         if tree and self.current_crack_item:
             tree.update_progress(self.current_crack_item, None, elapsed)
-            self._persist_record()
+            if time.time() - self._last_persist >= 5.0:
+                self._persist_record()
 
     def _format_elapsed(self, start):
         elapsed = max(0, int(time.time() - start))
