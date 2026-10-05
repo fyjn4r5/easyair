@@ -74,12 +74,15 @@ class EasyAirApp(MainUI):
         self.mon_iface = None
         self.physical_iface = None
         self._last_csv = None
-        self.auto_monitor_enabled = True
+        self.auto_monitor_enabled = self.core.config.get("auto_monitor", True)
+        self.scan_auto_stop = int(self.core.config.get("scan_auto_stop", 0) or 0)
 
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self._parse_scan_csv)
         self.scan_timer.setInterval(1500)
         self.scan_start_time = time.time()
+        self.scan_deadline = None
+        self._stopping_scan = False
 
         # 破解相关状态
         self.current_crack_item = None
@@ -99,6 +102,12 @@ class EasyAirApp(MainUI):
         self._refresh_cap_tree()
 
     def closeEvent(self, event):
+        if self.mon_iface:
+            self.log(f"[退出] 关闭监听模式: {self.mon_iface}")
+            try:
+                self.core.stop_monitor(self.mon_iface)
+            except Exception as e:
+                print(f"[退出] 关闭监听模式失败: {e}")
         self._stop_threads()
         super().closeEvent(event)
 
@@ -286,8 +295,12 @@ class EasyAirApp(MainUI):
         vals = dlg.values()
         self.core.config.update(vals)
         self.core.save_config()
+        self.auto_monitor_enabled = vals["auto_monitor"]
+        self.scan_auto_stop = vals["scan_auto_stop"]
         self._refresh_engine_label()
         self.log(f"[设置] 引擎={vals['crack_engine']} | 设备={vals['crack_device']}")
+        self.log(f"[设置] 扫描自动停止="
+                 f"{self.scan_auto_stop}s" if self.scan_auto_stop else "[设置] 扫描需手动停止")
 
     def _refresh_engine_label(self):
         engine = self.core.config.get("crack_engine", "Hashcat (GPU/CPU)")
@@ -467,8 +480,15 @@ class EasyAirApp(MainUI):
         self.log(f"> 扫描 AP: {self.mon_iface}")
         self.btn_scan.setText("🔍 扫描中...")
         self.scan_start_time = time.time()
+        self.scan_deadline = (time.time() + self.scan_auto_stop
+                               if self.scan_auto_stop > 0 else None)
+        if self.scan_deadline:
+            self.log(f"[扫描] 将在 {self.scan_auto_stop} 秒后自动停止")
+        else:
+            self.log("[扫描] 不会自动停止，请点'停止扫描'")
         self._run_worker(lambda: self.core.airodump_scan(self.mon_iface, "scan"),
                          self._on_scan_started)
+        self.scan_elapsed.setText(self._scan_elapsed_text())
         self.scan_timer.start()
         self.set_scan_status("scanning")
 
@@ -476,24 +496,51 @@ class EasyAirApp(MainUI):
         self.scan_thread = self._spawn_cmd(proc, self.log)
         self.set_status("扫描中... 0s / 0 个 AP")
 
+    def _scan_elapsed_text(self):
+        base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
+        if self.scan_deadline:
+            left = int(self.scan_deadline - time.time())
+            base += f" | {left}s 后自动停止" if left > 0 else " | 即将停止"
+        return base
+
     def _stop_scan(self):
-        if self.scan_thread:
-            self.scan_thread.stop()
-            self.scan_thread = None
-        self.scan_timer.stop()
-        self._parse_scan_csv(force=True)
-        self._auto_stop_monitor()
-        self.btn_scan.setEnabled(True)
-        self.btn_stop_scan.setEnabled(False)
-        self.btn_scan.setText("🔍 开始扫描")
-        self.set_scan_status("idle")
-        self.set_status(f"扫描已停止 - 共发现 {self.ap_table.rowCount()} 个 AP")
+        if self._stopping_scan:
+            return
+        self._stopping_scan = True
+        try:
+            if self.scan_thread:
+                self.scan_thread.stop()
+                self.scan_thread = None
+            self.scan_timer.stop()
+            self.scan_deadline = None
+            self._parse_scan_csv(force=True)
+            self.btn_scan.setEnabled(True)
+            self.btn_stop_scan.setEnabled(False)
+            self.btn_scan.setText("🔍 开始扫描")
+            self.set_scan_status("idle")
+            n = self.ap_table.rowCount()
+            self.set_status(f"扫描已停止 - 共发现 {n} 个 AP")
+            if self.mon_iface:
+                self.log(f"[提示] 监听模式保持开启({self.mon_iface})，可直接抓取握手包")
+            else:
+                self.log("[提示] 监听模式未开启，请点顶部按钮开启后再抓包")
+        finally:
+            self._stopping_scan = False
 
     def _find_latest_csv(self):
         csvs = [c for c in self.core.caps_dir.glob("scan*.csv") if c.is_file()]
         return max(csvs, key=lambda x: x.stat().st_mtime) if csvs else None
 
     def _parse_scan_csv(self, force=False):
+        # 倒计时/自动停止与"是否发现新 AP"无关, 每次 tick 都要处理
+        if self.scan_timer.isActive():
+            self.scan_elapsed.setText(self._scan_elapsed_text())
+            if self.scan_deadline and time.time() >= self.scan_deadline:
+                self.log("[扫描] 达到设定时长，自动停止")
+                self.scan_deadline = None
+                self._stop_scan()
+                return
+
         csv = self._find_latest_csv()
         if not csv:
             return
@@ -543,9 +590,7 @@ class EasyAirApp(MainUI):
                     for c, v in enumerate(r):
                         self.ap_table.setItem(i, c, QTableWidgetItem(v))
                 self.ap_table.setUpdatesEnabled(True)
-                self.scan_elapsed.setText(
-                    f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
-                )
+                self.scan_elapsed.setText(self._scan_elapsed_text())
                 self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
         except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")

@@ -344,6 +344,64 @@ def main():
           str(w2.log_scan_box.blockCount()))
     check("AP 表行数正确", w2.ap_table.rowCount() == 30, str(w2.ap_table.rowCount()))
 
+    section("扫描停止行为")
+    stopped = {"n": 0}
+    w2.core.stop_monitor = lambda m: (stopped.__setitem__("n", stopped["n"] + 1),
+                                      subprocess.Popen(["sh", "-c", "true"],
+                                                       stdout=subprocess.PIPE,
+                                                       stderr=subprocess.STDOUT,
+                                                       text=True, bufsize=1))[1]
+    w2.mon_iface = "wlan0mon"
+    w2.scan_auto_stop = 0
+    w2.scan_deadline = None
+    w2._stop_scan()
+    pump(80)
+    check("停止扫描不关闭监听模式", stopped["n"] == 0, f"stop_monitor 调用 {stopped['n']} 次")
+    check("停止后监听接口仍保留", w2.mon_iface == "wlan0mon", str(w2.mon_iface))
+    check("停止后提示可直接抓包", "可直接抓取握手包" in w2.log_scan_box.toPlainText())
+    check("停止后扫描按钮恢复", w2.btn_scan.isEnabled())
+    check("停止后停止按钮禁用", not w2.btn_stop_scan.isEnabled())
+    check("停止后按钮文案复位", w2.btn_scan.text() == "🔍 开始扫描", w2.btn_scan.text())
+
+    section("扫描自动停止")
+    w2.scan_auto_stop = 45
+    w2.core.airodump_scan = lambda m, p: subprocess.Popen(
+        ["sh", "-c", "echo scanning; sleep 30"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    w2._do_scan()
+    pump(200)
+    check("自动停止倒计时已设置", w2.scan_deadline is not None)
+    check("倒计时提示立即可见", "后自动停止" in w2.scan_elapsed.text(), w2.scan_elapsed.text())
+    check("倒计时秒数正确", "4" in w2.scan_elapsed.text(), w2.scan_elapsed.text())
+    # 快进: 把 deadline 提前，触发 _parse_scan_csv 里的自动停止分支
+    hdr3 = hdr
+    (tmp / "captures" / "scan-01.csv").write_text(hdr3 + "\n" + ap_line(0) + "\n")
+    w2.scan_deadline = time.time() - 1
+    w2._last_csv = None
+    w2._parse_scan_csv()
+    pump(100)
+    check("到达时限自动停止", w2.scan_deadline is None or w2.btn_scan.isEnabled())
+    check("自动停止后计时器已停", not w2.scan_timer.isActive())
+    check("自动停止保留监听接口", w2.mon_iface == "wlan0mon", str(w2.mon_iface))
+    w2.scan_auto_stop = 0
+
+    section("设置: 扫描自动停止秒数")
+    dlg2 = U.CrackSettingsDialog(w2, w2.core.config)
+    check("设置含扫描秒数控件", dlg2.scan_secs.value() >= 0)
+    dlg2.scan_secs.setValue(45)
+    v2 = dlg2.values()
+    check("values 含 scan_auto_stop", v2["scan_auto_stop"] == 45, str(v2))
+    check("0 表示手动停止", dlg2.scan_secs.minimum() == 0)
+    check("0 时显示手动停止", dlg2.scan_secs.specialValueText() == "手动停止")
+
+    section("设置: auto_monitor 真正生效")
+    check("auto_monitor 从配置读取", w2.auto_monitor_enabled == w2.core.config.get("auto_monitor", True))
+    dlg3 = U.CrackSettingsDialog(w2, w2.core.config)
+    dlg3.auto_mon.setChecked(False)
+    w2.core.config.update(dlg3.values())
+    w2.auto_monitor_enabled = w2.core.config["auto_monitor"]
+    check("取消勾选后为 False", w2.auto_monitor_enabled is False)
+
     section("关闭时清理线程")
     w2.close()
     pump(100)

@@ -231,13 +231,22 @@ class CrackSettingsDialog(QDialog):
         self.extra_args.setPlaceholderText("--force --opencl-device-types 1,2")
         form.addRow("Hashcat 额外参数:", self.extra_args)
 
-        self.auto_mon = QCheckBox("自动监听模式 (推荐)")
+        self.auto_mon = QCheckBox("自动监听模式 (扫描时自动开启)")
         self.auto_mon.setChecked(config.get("auto_monitor", True))
         form.addRow(self.auto_mon)
 
+        self.scan_secs = QSpinBox()
+        self.scan_secs.setRange(0, 3600)
+        self.scan_secs.setSingleStep(15)
+        self.scan_secs.setSuffix(" 秒")
+        self.scan_secs.setSpecialValueText("手动停止")
+        self.scan_secs.setValue(int(config.get("scan_auto_stop", 0) or 0))
+        form.addRow("扫描自动停止:", self.scan_secs)
+
         layout.addLayout(form)
 
-        hint = QLabel("提示: Aircrack-ng 仅支持 CPU，切换引擎时设备会自动锁定。")
+        hint = QLabel("提示: Aircrack-ng 仅支持 CPU，切换引擎时设备会自动锁定。\n"
+                      "停止扫描不会关闭监听模式，可直接继续抓取握手包。")
         hint.setStyleSheet("color: #888;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -263,6 +272,7 @@ class CrackSettingsDialog(QDialog):
             "crack_device": self.device_combo.currentText(),
             "hashcat_extra_args": self.extra_args.text().strip(),
             "auto_monitor": self.auto_mon.isChecked(),
+            "scan_auto_stop": self.scan_secs.value(),
         }
 
 
