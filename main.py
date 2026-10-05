@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import io
 import re
 import time
 import shutil
@@ -89,6 +90,7 @@ class EasyAirApp(MainUI):
         self.scan_start_time = time.time()
         self.scan_deadline = None
         self._stopping_scan = False
+        self._scan_warned = False
         self.scan_returncode = None
 
         # 破解相关状态
@@ -216,6 +218,9 @@ class EasyAirApp(MainUI):
         self._workers.clear()
 
     # ===== 日志 =====
+    # 扫描多久还没有 AP 就主动诊断(airodump-ng 抓到 0 个 AP 时不会退出)
+    _NO_APS_TIMEOUT = 15
+
     # 真实报错关键词: 命中即绕过噪音过滤, 保证用户能看到失败原因
     _ERROR_KEYWORDS = (
         "not found", "no such file", "permission denied",
@@ -583,6 +588,7 @@ class EasyAirApp(MainUI):
         self.log(f"> 扫描 AP: {self.mon_iface}")
         self.btn_scan.setText("⏹ 扫描中")
         self.scan_start_time = time.time()
+        self._scan_warned = False
         self.scan_deadline = (time.time() + self.scan_auto_stop
                                if self.scan_auto_stop > 0 else None)
         if self.scan_deadline:
@@ -630,6 +636,44 @@ class EasyAirApp(MainUI):
             self.log(f"  · {h}")
         self.set_status(f"扫描失败 · {reason}")
 
+    def _warn_no_aps(self):
+        """扫描进行中但一直没有 AP。实测网卡接口状态给出可执行结论。"""
+        waited = int(time.time() - self.scan_start_time)
+        iface = self.mon_iface or "(空)"
+        self.log(f"[警告] 已扫描 {waited}s 仍未捕获到任何 AP")
+        self.set_status(f"扫描中 · {waited}s 未捕获 AP")
+
+        def _probe():
+            return {
+                "iface": iface,
+                "monitor": self.core.check_monitor_mode(iface) if self.mon_iface else False,
+                "ifaces": self.core.list_interfaces(),
+                "root": os.geteuid() == 0,
+                "elevate": self.core.can_elevate(),
+                "airodump": shutil.which("airodump-ng") or "",
+            }
+
+        self.set_status("扫描中 · 正在检测监听状态…")
+        self._run_worker(_probe, self._apply_no_aps_diag)
+
+    def _apply_no_aps_diag(self, d):
+        if not d:
+            self.log("  · 状态检测失败，请手动执行 airodump-ng 验证")
+            self.set_status("扫描中 · 仍未捕获 AP")
+            return
+
+        if not d["airodump"]:
+            self.log("  · 未找到 airodump-ng，请安装 aircrack-ng 套件")
+        if not self.mon_iface:
+            self.log("  · 监听接口为空，监听模式可能未开启成功")
+        elif not d["monitor"]:
+            self.log(f"  · 接口 {d['iface']} 不在 monitor 模式（网卡驱动可能不支持）")
+        if not d["root"] and not d["elevate"]:
+            self.log("  · 无 root 提权手段，airodump-ng 可能抓不到数据")
+        self.log(f"  · 当前可用无线接口: {', '.join(d['ifaces']) or '无'}")
+        self.log("  · 建议: 靠近 2.4GHz 热点后重试，或点顶部 ● 关闭再开启监听模式")
+        self.set_status("扫描中 · 仍未捕获 AP，请查看日志建议")
+
     def _scan_elapsed_text(self):
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
         if self.scan_deadline:
@@ -674,6 +718,13 @@ class EasyAirApp(MainUI):
                 self.scan_deadline = None
                 self._stop_scan()
                 return
+            # 看门狗: airodump-ng 抓到 0 个 AP 时并不会退出, 所以进程存活
+            # 不能代表成功。超时无 AP 必须主动提示, 否则界面永远停在"等待 AP"。
+            if (self.ap_table.rowCount() == 0
+                    and not self._scan_warned
+                    and time.time() - self.scan_start_time >= self._NO_APS_TIMEOUT):
+                self._scan_warned = True
+                self._warn_no_aps()
 
         csv = self._find_latest_csv()
         if not csv:
@@ -688,35 +739,7 @@ class EasyAirApp(MainUI):
         self._last_csv = sig
         try:
             txt = csv.read_text(errors="ignore", encoding="utf-8")
-            rows = []
-            for raw in txt.splitlines():
-                line = raw.strip()
-                if not line or line.startswith("BSSID") or line.startswith("Station MAC"):
-                    continue
-                parts = next(csvmod.reader([line]), None)
-                if not parts or len(parts) < 13:
-                    continue
-                bssid = parts[0].strip()
-                if not re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', bssid):
-                    continue
-                ch = parts[7].strip()
-                priv = parts[8].strip()
-                cipher = parts[9].strip()
-                auth = "WPA" if priv.startswith("WPA") else ("WEP" if priv == "WEP" else priv)
-                pwr = parts[10].strip()
-                essid = parts[12].strip()
-                try:
-                    pwr_int = int(float(pwr))
-                    if pwr_int >= -50:
-                        bars = "|||"
-                    elif pwr_int >= -70:
-                        bars = "||"
-                    else:
-                        bars = "|"
-                except ValueError:
-                    bars = ""
-                rows.append((bars, essid or "(隐藏)", bssid.upper(), ch,
-                             f"{priv}/{cipher}".strip("/"), auth, f"{pwr} dBm"))
+            rows = self._parse_ap_csv(txt)
             if rows:
                 self.ap_table.setUpdatesEnabled(False)
                 self.ap_table.setRowCount(len(rows))
@@ -728,6 +751,89 @@ class EasyAirApp(MainUI):
                 self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
         except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
+
+    # airodump-ng 的 CSV 表头随版本变化, 必须按列名映射而不是固定下标。
+    # 1.6 实测表头: BSSID, First time seen, Last time seen, channel, Speed,
+    # Privacy, Cipher, Authentication, Power, # beacons, # IV, LAN IP,
+    # ID-length, ESSID, Key  —— 与旧版 17 列格式列序完全不同。
+    _CSV_ALIASES = {
+        "bssid": ("bssid",),
+        "essid": ("essid",),
+        "ch": ("channel", "ch"),
+        "enc": ("privacy", "enc"),
+        "cipher": ("cipher",),
+        "auth": ("authentication", "auth"),
+        "power": ("power", "dbm", "signal"),
+        "station": ("stationmac", "station"),
+    }
+
+    @staticmethod
+    def _norm_col(name: str) -> str:
+        n = name.strip().lower().lstrip("#").replace(" ", "")
+        return n.replace("_", "").replace("-", "")
+
+    def _parse_ap_csv(self, txt: str):
+        """按表头名解析 airodump CSV, 返回表格行列表"""
+        idx = {}
+        rows = []
+        # airodump 的分隔符是 ", "，引号前多一个空格会使 CSV 规范失效，
+        # 含逗号的 SSID(如 "Cafe, Guest") 会被切成两列。先归一化再解析。
+        txt = re.sub(r",\s+(?=\")", ",", txt)
+        # 整流解析: 逐行切分会破坏含逗号/换行的 SSID 字段
+        for parts in csvmod.reader(io.StringIO(txt)):
+            if not parts:
+                continue
+
+            norm = [self._norm_col(p) for p in parts]
+            # 表头行: 含 bssid 且列数足够
+            if "bssid" in norm and len(parts) > 2:
+                idx = {}
+                for field, aliases in self._CSV_ALIASES.items():
+                    for a in aliases:
+                        key = self._norm_col(a)
+                        if key in norm:
+                            idx[field] = norm.index(key)
+                            break
+                continue
+
+            if not idx:
+                continue
+
+            def get(field):
+                i = idx.get(field)
+                if i is None or i >= len(parts):
+                    return ""
+                v = parts[i].strip()
+                # airodump 对含逗号的 SSID 加引号, 且引号前可能有空格
+                if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                    v = v[1:-1]
+                return v.strip()
+
+            bssid = get("bssid")
+            # station 行(握手包捕获时)的 BSSID 为空, 跳过
+            if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", bssid):
+                continue
+
+            ch = get("ch")
+            priv = get("enc") or "Open"
+            cipher = get("cipher")
+            auth = ("WPA" if priv.startswith("WPA")
+                    else "WEP" if priv.startswith("WEP") else priv)
+            pwr = get("power")
+            essid = get("essid")
+            if not ch:
+                ch = "-"
+            if not essid:
+                essid = "(隐藏)"
+            try:
+                pwr_int = int(float(pwr))
+                bars = "|||" if pwr_int >= -50 else ("||" if pwr_int >= -70 else "|")
+            except ValueError:
+                bars = ""
+            enc_col = f"{priv}/{cipher}".strip("/") if cipher else priv
+            rows.append((bars, essid, bssid.upper(), ch, enc_col, auth,
+                         f"{pwr} dBm" if pwr else ""))
+        return rows
 
     def _on_ap_double_clicked(self, row, col):
         self._select_target(row)

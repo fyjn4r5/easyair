@@ -169,16 +169,20 @@ def main():
     tree.setColumnWidth(0, 88)
     check("结果表列宽实际可改", tree.columnWidth(0) == 88)
 
-    section("扫描 CSV 解析")
-    hdr = ("BSSID,Station MAC,Host Station,MAX,LAST,Beacon,LAN,CH,ENC,CIPHER,"
-           "POWER,DBM,ESSID,STD,Radio,Hostspot,Probe")
+    section("扫描 CSV 解析 (airodump-ng 1.6 真实格式)")
+    # 真实表头来自实机 airodump-ng 1.6 输出。旧版按固定下标解析, 因列序
+    # 不同导致每列错位(SSID 显示成 ID-length、信道显示成 PSK)。
+    hdr = ("BSSID, First time seen, Last time seen, channel, Speed, Privacy,"
+           " Cipher, Authentication, Power, # beacons, # IV, LAN IP,"
+           " ID-length, ESSID, Key")
 
     def ap_line(i):
         b = "AA:BB:CC:DD:EE:%02X" % i
         priv = ["WPA2", "WPA", "WEP", "Open"][i % 4]
         cip = ["AES", "TKIP", "", ""][i % 4]
-        return (f"{b},00:00:00:00:00:00,00:00:00:00:00:00,-1,-1,-46,-1,{i%11+1},"
-                f"{priv},{cip},-{40+i*3},-{40+i*3},Net{i},,")
+        return (f"{b}, 2026-10-05 10:00:00, 2026-10-05 10:00:01, {i%11+1}, 130,"
+                f" {priv}, {cip}, PSK, -{40+i*3},        4,        0,"
+                f"   0.  0.  0.  0,   {i%14}, Net{i}, ")
 
     csv = tmp / "captures" / "scan-01.csv"
     csv.write_text(hdr + "\n" + "\n".join(ap_line(i) for i in range(6)) + "\n")
@@ -188,8 +192,9 @@ def main():
 
     csv.write_text(
         hdr + "\n" + "\n".join(ap_line(i) for i in range(15)) + "\n"
-        + '11:22:33:44:55:66,00:00:00:00:00:00,00:00:00:00:00:00,-1,-1,-58,-1,6,'
-          'WPA2,AES,-33,-33,"Cafe, Guest",,\n')
+        + '11:22:33:44:55:66, 2026-10-05 10:00:00, 2026-10-05 10:00:02, 6, 270,'
+          ' WPA2, AES, PSK, -33,        9,        0,   0.  0.  0.  0,  11,'
+          ' "Cafe, Guest", \n')
     pump(20)
     w._parse_scan_csv()
     check("增量刷新到 16 行", w.ap_table.rowCount() == 16, str(w.ap_table.rowCount()))
@@ -198,6 +203,32 @@ def main():
     check("SSID 无多余引号", all('"' not in e for e in essids), str(essids[-3:]))
     check("信道列正确", w.ap_table.item(0, 3).text() == "1", w.ap_table.item(0, 3).text())
     check("加密列正确", w.ap_table.item(0, 4).text() == "WPA2/AES", w.ap_table.item(0, 4).text())
+    check("SSID 不是 ID-length", w.ap_table.item(0, 1).text() == "Net0",
+          w.ap_table.item(0, 1).text())
+    check("认证列不是 Power", w.ap_table.item(0, 5).text() in ("WPA", "Open", "WEP"),
+          w.ap_table.item(0, 5).text())
+    check("信号列带 dBm", w.ap_table.item(0, 6).text().endswith("dBm"),
+          w.ap_table.item(0, 6).text())
+
+    section("扫描 CSV: 表头别名与旧格式兼容")
+    rows = w._parse_ap_csv(
+        "BSSID, First time seen, channel, Privacy, Power, ESSID\n"
+        "11:22:33:44:55:66, 2026-10-05 10:00:00, 11, WPA3, -55, MyWiFi\n")
+    check("短表头也能解析", len(rows) == 1, str(rows))
+    if rows:
+        check("短表头 SSID 正确", rows[0][1] == "MyWiFi", str(rows[0]))
+        check("短表头 信道正确", rows[0][3] == "11", str(rows[0]))
+        check("短表头 强度正确", "-55 dBm" == rows[0][6], str(rows[0]))
+    rows2 = w._parse_ap_csv(
+        "BSSID,Station MAC,Host Station,MAX,LAST,Beacon,LAN,CH,ENC,CIPHER,"
+        "POWER,DBM,ESSID,STD,Radio,Hostspot,Probe\n"
+        "22:33:44:55:66:77,00:00:00:00:00:00,00:00:00:00:00:00,-1,-1,-46,-1,9,"
+        "WPA2,AES,-60,-60,LegacyAP,,\n")
+    check("旧 17 列格式仍兼容", len(rows2) == 1 and rows2[0][1] == "LegacyAP",
+          str(rows2))
+    check("无 SSID 显示隐藏", w._parse_ap_csv(
+        "BSSID, channel, Privacy, Power, ESSID\n"
+        "33:44:55:66:77:88, 3, WPA2, -60, \n")[0][1] == "(隐藏)")
     check("状态栏显示 AP 数", "16" in w.status_label.text(), w.status_label.text())
     check("扫描时长标签有内容", "扫描时长" in w.scan_elapsed.text(), w.scan_elapsed.text())
 
