@@ -4,6 +4,7 @@ import json
 import subprocess
 import shlex
 import time
+import binascii
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -43,14 +44,14 @@ class AirCore:
             try:
                 with open(CONFIG_FILE) as f:
                     self.config.update(json.load(f))
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
 
     def save_config(self):
         try:
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(self.config, f, indent=2)
-        except Exception as e:
+        except OSError as e:
             print(f"[配置保存失败] {e}")
 
     def add_wordlist(self, path: str):
@@ -91,14 +92,14 @@ class AirCore:
             with open(HISTORY_FILE, encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else {}
-        except Exception:
+        except (json.JSONDecodeError, OSError):
             return {}
 
     def save_history(self, data: dict):
         try:
             with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
+        except OSError as e:
             print(f"[历史保存失败] {e}")
 
     def history_dates(self) -> List[str]:
@@ -152,10 +153,10 @@ class AirCore:
                     decoded = base64.b64decode(content).decode('utf-8')
                     self._sudo_password = decoded.strip()
                     return self._sudo_password
-                except Exception:
+                except (binascii.Error, UnicodeDecodeError, ValueError):
                     self._sudo_password = content
                     return self._sudo_password
-            except Exception:
+            except OSError:
                 pass
         return None
 
@@ -169,7 +170,7 @@ class AirCore:
                 timeout=5
             )
             return proc.returncode == 0
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError, ValueError):
             return False
 
     def _run_sudo(self, args: List[str]) -> subprocess.CompletedProcess:
@@ -252,38 +253,38 @@ class AirCore:
 
     def list_interfaces(self) -> List[str]:
         try:
-            res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5)
             if res.returncode != 0:
                 return []
             return re.findall(r'Interface\s+(\w+)', res.stdout)
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError, ValueError):
             return []
 
     def get_monitor_interface(self, iface: str) -> Optional[str]:
         try:
-            res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5)
             for line in res.stdout.splitlines():
                 if iface in line and "mon" in line:
                     parts = line.split()
                     for p in parts:
                         if p.startswith(iface) and "mon" in p:
                             return p
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             pass
         return None
 
     def check_monitor_mode(self, iface: str) -> bool:
         try:
-            res = subprocess.run(["iwconfig", iface], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            res = subprocess.run(["iwconfig", iface], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5)
             if "Mode:Monitor" in res.stdout:
                 return True
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             pass
         try:
-            res = subprocess.run(["iw", "dev", iface, "info"], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            res = subprocess.run(["iw", "dev", iface, "info"], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5)
             if "type monitor" in res.stdout:
                 return True
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             pass
         return False
 

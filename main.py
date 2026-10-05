@@ -2,6 +2,7 @@
 import sys
 import re
 import time
+import subprocess
 import csv as csvmod
 from pathlib import Path
 from typing import Optional
@@ -31,7 +32,7 @@ class CmdThread(QThread):
                     break
                 self.line_out.emit(line.rstrip())
             self.proc.wait()
-        except Exception as e:
+        except (OSError, ValueError) as e:
             print(f"[CmdThread] {e}")
         finally:
             self.done.emit()
@@ -42,7 +43,7 @@ class CmdThread(QThread):
             try:
                 self.proc.terminate()
                 self.proc.wait(timeout=2)
-            except Exception:
+            except (OSError, subprocess.TimeoutExpired, ValueError):
                 pass
 
 
@@ -56,7 +57,7 @@ class FuncThread(QThread):
     def run(self):
         try:
             self.done.emit(self._fn())
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 线程边界必须兜底
             print(f"[FuncThread] {e}")
             self.done.emit(None)
 
@@ -179,7 +180,7 @@ class EasyAirApp(MainUI):
             try:
                 if t.isRunning():
                     t.wait(2000)
-            except Exception:
+            except RuntimeError:
                 pass
         self._threads.clear()
 
@@ -546,7 +547,7 @@ class EasyAirApp(MainUI):
                     f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
                 )
                 self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
-        except Exception as e:
+        except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
     def _on_ap_double_clicked(self, row, col):
@@ -812,7 +813,7 @@ class EasyAirApp(MainUI):
                         ]) + "\n")
             QMessageBox.information(self, "成功", f"已导出到: {fn}")
             self.log(f"[导出] 结果已保存到: {fn}")
-        except Exception as e:
+        except OSError as e:
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
