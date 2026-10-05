@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 import sys
 import re
-import signal
+import time
 from pathlib import Path
 from PyQt5.QtWidgets import QApplication, QMessageBox, QTableWidgetItem, QFileDialog
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
 
-from ui.main_ui import MainUI
+from ui.main_ui import MainUI, WordListDialog
 from core.aircore import AirCore
+
 
 class CmdThread(QThread):
     line_out = pyqtSignal(str)
@@ -57,46 +58,49 @@ class EasyAirApp(MainUI):
         self.scan_timer.timeout.connect(self._parse_scan_csv)
         self.scan_timer.setInterval(1500)
 
+        # 破解相关状态
+        self.current_crack_item = None
+        self.crack_start_time = 0
+        self.crack_timer = QTimer(self)
+        self.crack_timer.timeout.connect(self._update_crack_timer)
+        self.crack_timer.setInterval(1000)
+
         self._bind()
         self._load_wordlists()
         self._refresh_ifaces()
-        self._refresh_cap()
 
     def _bind(self):
         # 网卡
-        self.btn_refresh.clicked.connect(self._refresh_ifaces)
-        self.btn_mon_toggle.toggled.connect(self._on_mon_toggle)
+        self.btn_refresh_iface.clicked.connect(self._refresh_ifaces)
 
-        # 扫描
+        # 扫描/抓包
         self.btn_scan.clicked.connect(self._start_scan)
         self.btn_stop_scan.clicked.connect(self._stop_scan)
         self.btn_capture.clicked.connect(self._start_capture)
         self.btn_deauth.clicked.connect(self._do_deauth)
-        self.btn_auto.clicked.connect(self._auto_full)
 
-        # 字典
-        self.btn_add_wl.clicked.connect(self._add_wordlist_files)
-        self.btn_add_wl_dir.clicked.connect(self._add_wordlist_dir)
-        self.btn_clear_wl.clicked.connect(self._clear_wordlists)
-        self.wordlist_widget.order_changed.connect(self._on_wordlist_order_changed)
+        # 字典管理
+        self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
 
-        # 破解
-        self.btn_choose_cap.clicked.connect(self._choose_cap)
-        self.btn_refresh_cap.clicked.connect(self._refresh_cap)
-        self.btn_crack.clicked.connect(self._start_crack)
+        # 破解设置 (暂时用对话框)
+        self.btn_crack_cfg.clicked.connect(self._open_crack_settings)
+
+        # 破解控制
+        self.btn_start_crack.clicked.connect(self._start_crack)
         self.btn_stop_crack.clicked.connect(self._stop_crack)
+        self.btn_export.clicked.connect(self._export_results)
 
-        # 配置变更
-        self.chk_auto_mon.toggled.connect(self._on_auto_mon_changed)
-        self.crack_engine.currentIndexChanged.connect(self._on_engine_changed)
-        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
-        self.hashcat_extra.textChanged.connect(self._on_extra_args_changed)
+        # AP 表格双击选择目标
+        self.ap_table.cellDoubleClicked.connect(self._on_ap_double_clicked)
 
     def log(self, txt: str):
         self.log_box.append(txt)
         self.log_box.ensureCursorVisible()
 
-    # ===== 网卡与监听模式 =====
+    def set_status(self, txt: str):
+        self.status_label.setText(txt)
+
+    # ===== 网卡 =====
     def _refresh_ifaces(self):
         self.iface_combo.clear()
         for i in self.core.list_interfaces():
@@ -106,94 +110,102 @@ class EasyAirApp(MainUI):
             self.log("  - 真机: 确认网卡驱动正常")
             self.log("  - 虚拟机: 需将支持监听的 USB 无线网卡直通")
 
-    def _on_mon_toggle(self, checked: bool):
-        iface = self.iface_combo.currentText()
-        if not iface:
-            self.btn_mon_toggle.setChecked(False)
-            return
+    # ===== 字典管理 =====
+    def _load_wordlists(self):
+        for wl in self.core.get_wordlists():
+            pass  # 不在主界面显示，只在对话框管理
 
-        if checked:
-            self.log(f"> 开启监听模式: {iface}")
-            p = self.core.start_monitor(iface)
-            self.mon_thread = CmdThread(p)
-            self.mon_thread.line_out.connect(self.log)
-            self.mon_thread.finished.connect(self._on_mon_started)
-            self.mon_thread.start()
-            self.physical_iface = iface
-        else:
-            mon = self.mon_iface or iface
-            self.log(f"> 关闭监听模式: {mon}")
-            p = self.core.stop_monitor(mon)
-            t = CmdThread(p)
-            t.line_out.connect(self.log)
-            t.finished.connect(self._on_mon_stopped)
-            t.start()
+    def _open_dict_manager(self):
+        dlg = WordListDialog(self, self.core.get_wordlists())
+        if dlg.exec_() == WordListDialog.Accepted:
+            new_lists = dlg.get_wordlists()
+            self.core.config["wordlists"] = new_lists
+            self.core.save_config()
+            self.log(f"[字典] 已更新，共 {len(new_lists)} 个字典文件")
 
-    def _on_mon_started(self):
-        self._refresh_ifaces()
-        # 查找新的 mon 接口
-        for i in range(self.iface_combo.count()):
-            txt = self.iface_combo.itemText(i)
-            if "mon" in txt and self.physical_iface in txt:
-                self.iface_combo.setCurrentIndex(i)
-                self.mon_iface = txt
-                self.log(f"[就绪] 监听接口: {txt}")
-                break
-
-    def _on_mon_stopped(self):
-        self.mon_iface = None
-        self.physical_iface = None
-        self._refresh_ifaces()
-
-    def _on_auto_mon_changed(self, checked: bool):
-        self.auto_monitor_enabled = checked
-        self.core.config["auto_monitor"] = checked
-        self.core.save_config()
-        self.log(f"[配置] 自动监听模式: {'开启' if checked else '关闭'}")
-
-    def _ensure_monitor(self) -> bool:
-        """自动确保监听模式开启，返回是否成功"""
-        if not self.auto_monitor_enabled:
-            return True
-        if self.mon_iface and self.core.check_monitor_mode(self.mon_iface):
-            return True
-        physical = self.physical_iface or self.iface_combo.currentText()
-        if not physical:
-            return False
-        self.log("[自动] 正在开启监听模式...")
-        ok, mon = self.core.ensure_monitor(physical)
-        if ok:
-            self.mon_iface = mon
-            self.btn_mon_toggle.setChecked(True)
-            self.log(f"[自动] 监听模式已就绪: {mon}")
-            return True
-        self.log("[自动] 监听模式开启失败")
-        return False
-
-    def _auto_stop_monitor(self):
-        """自动关闭监听模式（不抓包时）"""
-        if self.auto_monitor_enabled and self.mon_iface:
-            self.log("[自动] 关闭监听模式...")
-            p = self.core.stop_monitor(self.mon_iface)
-            t = CmdThread(p)
-            t.line_out.connect(self.log)
-            t.finished.connect(lambda: setattr(self, 'mon_iface', None))
-            t.start()
-            self.btn_mon_toggle.setChecked(False)
+    def _open_crack_settings(self):
+        # 简单对话框
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QLineEdit, QDialogButtonBox, QCheckBox, QComboBox
+        dlg = QDialog(self)
+        dlg.setWindowTitle("破解设置")
+        dlg.resize(400, 250)
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        
+        extra_args = QLineEdit(self.core.config.get("hashcat_extra_args", ""))
+        extra_args.setPlaceholderText("--force --opencl-device-types 1,2")
+        form.addRow("Hashcat 额外参数:", extra_args)
+        
+        auto_mon = QCheckBox("自动监听模式 (推荐)")
+        auto_mon.setChecked(self.core.config.get("auto_monitor", True))
+        form.addRow(auto_mon)
+        
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        
+        if dlg.exec_() == QDialog.Accepted:
+            self.core.set_hashcat_extra_args(extra_args.text())
+            self.core.config["auto_monitor"] = auto_mon.isChecked()
+            self.core.save_config()
+            self.log("[设置] 已保存")
 
     # ===== 扫描 AP =====
     def _start_scan(self):
-        if not self._ensure_monitor():
-            QMessageBox.warning(self, "提示", "请先开启监听模式")
+        physical = self.iface_combo.currentText()
+        if not physical:
+            QMessageBox.warning(self, "提示", "请先选择无线网卡")
             return
-        mon = self.mon_iface or self.iface_combo.currentText()
-        self.log(f"> 扫描 AP: {mon}")
-        p = self.core.airodump_scan(mon, "scan")
+
+        self.set_status("正在开启监听模式并扫描...")
+        self.log(f"[自动] 开启监听模式: {physical}")
+        
+        # 后台线程处理监听模式开启 + 扫描
+        self.physical_iface = physical
+        self.mon_thread = CmdThread(self.core.start_monitor(physical))
+        self.mon_thread.line_out.connect(self.log)
+        self.mon_thread.finished.connect(self._on_mon_ready_for_scan)
+        self.mon_thread.start()
+        
+        self.btn_scan.setEnabled(False)
+        self.btn_stop_scan.setEnabled(True)
+
+    def _on_mon_ready_for_scan(self):
+        """监听模式就绪，开始扫描"""
+        # 查找监听接口
+        for i in range(self.iface_combo.count()):
+            txt = self.iface_combo.itemText(i)
+            if "mon" in txt and self.physical_iface in txt:
+                self.mon_iface = txt
+                break
+        
+        if not self.mon_iface:
+            # 兜底：重新检测
+            for i in self.core.list_interfaces():
+                if "mon" in i:
+                    self.mon_iface = i
+                    break
+        
+        if self.mon_iface:
+            self.log(f"[就绪] 监听接口: {self.mon_iface}")
+            self._do_scan()
+        else:
+            self.log("[错误] 监听模式开启失败")
+            self.btn_scan.setEnabled(True)
+            self.btn_stop_scan.setEnabled(False)
+            self.set_status("监听模式开启失败")
+
+    def _do_scan(self):
+        """实际开始 airodump-ng 扫描"""
+        self.log(f"> 扫描 AP: {self.mon_iface}")
+        p = self.core.airodump_scan(self.mon_iface, "scan")
         self.scan_thread = CmdThread(p)
         self.scan_thread.line_out.connect(self.log)
         self.scan_thread.start()
         self.scan_timer.start()
-        self.log("[扫描中] 正在列出附近 AP... 点击'停止扫描'查看列表")
+        self.set_status("扫描中... 点击'停止扫描'查看列表")
 
     def _stop_scan(self):
         if self.scan_thread:
@@ -202,7 +214,9 @@ class EasyAirApp(MainUI):
         self.scan_timer.stop()
         self._parse_scan_csv(force=True)
         self._auto_stop_monitor()
-        self.log("[已停止] 扫描结束")
+        self.btn_scan.setEnabled(True)
+        self.btn_stop_scan.setEnabled(False)
+        self.set_status("扫描已停止")
 
     def _find_latest_csv(self):
         csvs = list(self.core.caps_dir.glob("scan*.csv"))
@@ -224,11 +238,22 @@ class EasyAirApp(MainUI):
                 parts = re.split(r',\s*', line)
                 if len(parts) < 14:
                     continue
-                bssid, ch, priv, cipher, auth, pwr, beac = parts[0], parts[3], parts[5], parts[6], parts[7], parts[8], parts[9]
+                bssid, ch, priv, cipher, auth, pwr = parts[0], parts[3], parts[5], parts[6], parts[7], parts[8]
                 essid = ','.join(parts[13:]).strip().strip('"')
                 if not bssid:
                     continue
-                rows.append((essid or "(隐藏)", bssid, ch.strip(), priv.strip(), cipher.strip(), auth.strip(), pwr.strip()))
+                # 信号强度转为图标
+                try:
+                    pwr_int = int(pwr)
+                    if pwr_int >= -50:
+                        sig = "📶📶📶"
+                    elif pwr_int >= -70:
+                        sig = "📶📶"
+                    else:
+                        sig = "📶"
+                except:
+                    sig = "📶"
+                rows.append((sig, essid or "(隐藏)", bssid, ch.strip(), f"{priv}/{cipher}", auth.strip(), pwr))
             if rows:
                 self.ap_table.setRowCount(0)
                 for r in rows:
@@ -237,139 +262,127 @@ class EasyAirApp(MainUI):
                     for c, v in enumerate(r):
                         self.ap_table.setItem(i, c, QTableWidgetItem(v))
                 self.log(f"[解析] 更新 AP 列表: {len(rows)} 个")
+                self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
         except Exception as e:
             self.log(f"[解析失败] {e}")
 
+    def _on_ap_double_clicked(self, row, col):
+        """双击 AP 选择为目标"""
+        self._select_target(row)
+
+    def _select_target(self, row):
+        if row < 0:
+            return
+        essid = self.ap_table.item(row, 1).text()
+        bssid = self.ap_table.item(row, 2).text()
+        ch = self.ap_table.item(row, 3).text()
+        enc = self.ap_table.item(row, 4).text()
+        
+        self.lbl_target_essid.setText(essid)
+        self.lbl_target_bssid.setText(bssid)
+        self.lbl_target_ch.setText(ch)
+        self.lbl_target_enc.setText(enc)
+        self.lbl_handshake.setText("未捕获")
+        self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
+        
+        self.log(f"[目标] 已选择: {essid} ({bssid}) CH:{ch}")
+        self.set_status(f"目标已锁定: {essid} - 点击'抓取握手包'")
+
     # ===== 抓包 =====
     def _start_capture(self):
-        row = self.ap_table.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "提示", "请先从 AP 列表中选择一个目标")
+        essid = self.lbl_target_essid.text()
+        bssid = self.lbl_target_bssid.text()
+        ch = self.lbl_target_ch.text()
+        if essid == "未选择" or not bssid:
+            QMessageBox.warning(self, "提示", "请先在左侧列表双击选择目标 AP")
             return
-        if not self._ensure_monitor():
+
+        if not self.mon_iface:
             QMessageBox.warning(self, "提示", "监听模式未就绪")
             return
 
-        essid = self.ap_table.item(row, 0).text()
-        bssid = self.ap_table.item(row, 1).text()
-        ch = self.ap_table.item(row, 2).text()
-        mon = self.mon_iface
-
         self.log(f"[抓包] 目标: {essid} | {bssid} | CH:{ch}")
-        self.log(f"> airodump-ng --bssid {bssid} --channel {ch} -w captures/handshake {mon}")
-        p = self.core.airodump_capture(mon, bssid, ch, "handshake")
+        self.log(f"> airodump-ng --bssid {bssid} --channel {ch} -w captures/handshake {self.mon_iface}")
+        p = self.core.airodump_capture(self.mon_iface, bssid, ch, "handshake")
         self.cap_thread = CmdThread(p)
         self.cap_thread.line_out.connect(self.log)
         self.cap_thread.start()
-        self.log("[提示] 正在抓取握手包... 可点击'一键 Deauth'加速")
-        self._refresh_cap()
+        
+        # 定时检查握手包
+        self.cap_check_timer = QTimer(self)
+        self.cap_check_timer.timeout.connect(self._check_handshake)
+        self.cap_check_timer.setInterval(2000)
+        self.cap_check_timer.start()
+        
+        self.set_status("正在抓取握手包... 可点击 Deauth 加速")
+
+    def _check_handshake(self):
+        cap = self.core.get_latest_handshake()
+        if cap:
+            self.lbl_handshake.setText(f"已捕获: {cap.name}")
+            self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            self.log(f"[成功] 捕获握手包: {cap}")
+            self.set_status(f"握手包已捕获: {cap.name} - 可开始破解")
+            if hasattr(self, 'cap_check_timer'):
+                self.cap_check_timer.stop()
 
     def _do_deauth(self):
-        row = self.ap_table.currentRow()
-        if row < 0:
+        bssid = self.lbl_target_bssid.text()
+        if not bssid or bssid == "未选择":
             return
         if not self.mon_iface:
             return
-        bssid = self.ap_table.item(row, 1).text()
         self.log(f"> aireplay-ng --deauth 10 -a {bssid} {self.mon_iface}")
         p = self.core.deauth(self.mon_iface, bssid, 10)
         t = CmdThread(p)
         t.line_out.connect(self.log)
         t.start()
 
-    def _auto_full(self):
-        """一键全自动：扫描 -> 用户选中 -> 抓包 -> Deauth"""
-        if not self._ensure_monitor():
-            QMessageBox.warning(self, "提示", "监听模式未就绪")
-            return
-        if self.scan_thread is None:
-            self._start_scan()
-            self.log("[自动] 请等待扫描完成，然后在列表选中目标，再次点击'一键全自动'开始抓包")
-        else:
-            self._stop_scan()
-            self._start_capture()
-            # 自动发送一次 deauth
-            QTimer.singleShot(3000, self._do_deauth)
+    def _auto_stop_monitor(self):
+        if self.auto_monitor_enabled and self.mon_iface:
+            self.log("[自动] 关闭监听模式...")
+            p = self.core.stop_monitor(self.mon_iface)
+            t = CmdThread(p)
+            t.line_out.connect(self.log)
+            t.finished.connect(lambda: setattr(self, 'mon_iface', None))
+            t.start()
 
-    # ===== 字典管理 =====
-    def _load_wordlists(self):
-        for wl in self.core.get_wordlists():
-            self.wordlist_widget.add_wordlist(wl)
-
-    def _add_wordlist_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "选择字典文件", str(self.core.wordlists_dir), "文本文件 (*.txt *.lst *.dic);;所有文件 (*.*)")
-        for f in files:
-            self.wordlist_widget.add_wordlist(f)
-            self.core.add_wordlist(f)
-
-    def _add_wordlist_dir(self):
-        dir_path = QFileDialog.getExistingDirectory(self, "选择字典目录", str(self.core.wordlists_dir))
-        if dir_path:
-            for ext in ("*.txt", "*.lst", "*.dic", "*.dict"):
-                for f in Path(dir_path).rglob(ext):
-                    self.wordlist_widget.add_wordlist(str(f))
-                    self.core.add_wordlist(str(f))
-
-    def _clear_wordlists(self):
-        self.wordlist_widget.clear()
-        self.core.clear_wordlists()
-
-    def _on_wordlist_order_changed(self, paths):
-        self.core.reorder_wordlists(paths)
-
-    # ===== 破解设置 =====
-    def _on_engine_changed(self, idx):
-        pass
-
-    def _on_device_changed(self, idx):
-        self.core.set_use_gpu(idx != 2)  # 2 = 仅 CPU
-
-    def _on_extra_args_changed(self, txt):
-        self.core.set_hashcat_extra_args(txt)
-
-    # ===== 握手包选择 =====
-    def _refresh_cap(self):
-        cap = self.core.get_latest_handshake()
-        if cap:
-            self.cap_path.setText(str(cap))
-            self.cap_path.setStyleSheet("color: #2e7d32; font-weight: bold;")
-        else:
-            self.cap_path.setText("未检测到握手包 (captures/handshake-*.cap)")
-            self.cap_path.setStyleSheet("color: #c62828;")
-
-    def _choose_cap(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "选择握手包", str(self.core.caps_dir), "CAP Files (*.cap);;All (*.*)")
-        if fn:
-            self.cap_path.setText(fn)
-            self.cap_path.setStyleSheet("color: #2e7d32; font-weight: bold;")
-            self.log(f"[已选择] 握手包: {fn}")
-
-    # ===== 破解执行 =====
+    # ===== 破解 =====
     def _start_crack(self):
-        cap = self.cap_path.text()
-        if not cap or cap.startswith("未检测") or cap.startswith("自动检测"):
-            QMessageBox.warning(self, "提示", "请选择有效的握手包 .cap 文件")
+        cap = self.core.get_latest_handshake()
+        if not cap:
+            QMessageBox.warning(self, "提示", "未检测到握手包，请先抓取握手包")
             return
-        wordlists = self.wordlist_widget.get_all()
+        wordlists = self.core.get_wordlists()
         if not wordlists:
-            QMessageBox.warning(self, "提示", "请至少添加一个字典文件")
+            QMessageBox.warning(self, "提示", "请先在'字典管理'中添加字典文件")
             return
 
-        self._auto_stop_monitor()
+        # 添加到结果列表
+        essid = self.lbl_target_essid.text()
+        bssid = self.lbl_target_bssid.text()
+        self.current_crack_item = self.crack_result.add_target(bssid, essid, str(cap))
+        
+        self.progress_bar.setVisible(True)
+        self.lbl_progress.setText("正在启动破解...")
+        self.btn_start_crack.setEnabled(False)
+        self.btn_stop_crack.setEnabled(True)
+        self.crack_start_time = time.time()
+        self.crack_timer.start()
 
         engine = self.crack_engine.currentText()
         if engine == "Aircrack-ng":
-            # 仅使用第一个字典
             self.log(f"> aircrack-ng '{cap}' -w '{wordlists[0]}'")
-            p = self.core.crack_aircrack(cap, wordlists[0])
+            p = self.core.crack_aircrack(str(cap), wordlists[0])
             self.crack_thread = CmdThread(p)
-            self.crack_thread.line_out.connect(self.log)
+            self.crack_thread.line_out.connect(self._on_crack_output)
+            self.crack_thread.finished.connect(self._on_crack_finished)
             self.crack_thread.start()
             self.log("[破解中] Aircrack-ng 正在跑字典...")
         else:
-            self._run_hashcat(cap, wordlists)
+            self._run_hashcat(str(cap), wordlists)
 
-    def _run_hashcat(self, cap: str, wordlists: list):
+    def _run_hashcat(self, cap, wordlists):
         self.log("[Hashcat] 正在转换 .cap -> .hc22000...")
         pconv = self.core.cap_to_hc22000(cap)
         self.conv_thread = CmdThread(pconv)
@@ -381,28 +394,94 @@ class EasyAirApp(MainUI):
                 self.log(f"[转换完成] {hc}")
                 device_idx = self.device_combo.currentIndex()
                 use_gpu = device_idx != 2
-                extra = self.hashcat_extra.text().strip()
+                extra = self.core.config.get("hashcat_extra_args", "")
                 self.log(f"> hashcat -m 22000 {'-D 1,2' if use_gpu else '-D 1'} {extra} '{hc}' {' '.join(wordlists)}")
                 p2 = self.core.crack_hashcat(str(hc), wordlists, use_gpu, extra)
                 self.crack_thread = CmdThread(p2)
-                self.crack_thread.line_out.connect(self.log)
+                self.crack_thread.line_out.connect(self._on_crack_output)
+                self.crack_thread.finished.connect(self._on_crack_finished)
                 self.crack_thread.start()
-                self.log("[破解中] Hashcat 正在跑字典 (实时进度见日志)")
+                self.log("[破解中] Hashcat 正在跑字典...")
             else:
-                self.log("[错误] hcxpcapngtool 转换失败，请检查 .cap 是否包含有效握手")
+                self.log("[错误] hcxpcapngtool 转换失败")
+                self._on_crack_finished()
 
         self.conv_thread.finished.connect(on_conv_done)
         self.conv_thread.start()
+
+    def _on_crack_output(self, line):
+        """解析破解输出，提取密码"""
+        self.log(line)
+        # 简单解析：查找 KEY FOUND 或 password
+        if "KEY FOUND" in line or "FOUND" in line.upper():
+            # 尝试提取密码
+            import re
+            match = re.search(r'\[(.*?)\]', line) or re.search(r'KEY FOUND.*?(\S+)', line)
+            if match:
+                pwd = match.group(1)
+                self.crack_result.update_progress(self.current_crack_item, pwd, self._format_elapsed())
+                return
+            # 兜底：整行作为密码
+            self.crack_result.update_progress(self.current_crack_item, line.strip(), self._format_elapsed())
+
+    def _update_crack_timer(self):
+        elapsed = self._format_elapsed()
+        self.lbl_progress.setText(f"破解中... 已耗时: {elapsed}")
+        if self.current_crack_item:
+            self.crack_result.update_progress(self.current_crack_item, None, elapsed)
+
+    def _format_elapsed(self):
+        elapsed = int(time.time() - self.crack_start_time)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
+
+    def _on_crack_finished(self):
+        self.crack_timer.stop()
+        self.progress_bar.setVisible(False)
+        self.btn_start_crack.setEnabled(True)
+        self.btn_stop_crack.setEnabled(False)
+        
+        if self.current_crack_item:
+            # 检查是否已有密码
+            pwd = self.current_crack_item.text(2)
+            if not pwd or pwd == "破解中...":
+                self.crack_result.set_failed(self.current_crack_item, "未找到密码")
+        
+        self.lbl_progress.setText("破解完成")
+        self.set_status("破解任务结束")
+        self.log("[完成] 破解任务结束")
 
     def _stop_crack(self):
         if self.crack_thread:
             self.crack_thread.stop()
             self.crack_thread = None
-            self.log("[已停止] 破解已终止")
         if self.conv_thread:
             self.conv_thread.stop()
             self.conv_thread = None
-            self.log("[已停止] 转换已终止")
+        self.crack_timer.stop()
+        self.progress_bar.setVisible(False)
+        self.btn_start_crack.setEnabled(True)
+        self.btn_stop_crack.setEnabled(False)
+        if self.current_crack_item:
+            self.crack_result.set_failed(self.current_crack_item, "已停止")
+        self.log("[已停止] 破解已终止")
+        self.set_status("破解已停止")
+
+    def _export_results(self):
+        # 导出结果到 CSV
+        fn, _ = QFileDialog.getSaveFileName(self, "导出结果", str(Path.home() / "easyair_results.csv"), "CSV Files (*.csv)")
+        if fn:
+            try:
+                with open(fn, 'w', encoding='utf-8') as f:
+                    f.write("BSSID,ESSID,密码,握手包,状态,耗时\n")
+                    for i in range(self.crack_result.topLevelItemCount()):
+                        item = self.crack_result.topLevelItem(i)
+                        f.write(f"{item.text(0)},{item.text(1)},{item.text(2)},{item.text(3)},{item.text(4)},{item.text(5)}\n")
+                QMessageBox.information(self, "成功", f"已导出到: {fn}")
+                self.log(f"[导出] 结果已保存到: {fn}")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
 if __name__ == "__main__":
