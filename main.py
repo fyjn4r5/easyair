@@ -95,6 +95,7 @@ class EasyAirApp(MainUI):
         self.scan_start_time = time.time()
         self.scan_deadline = None
         self._stopping_scan = False
+        self._crack_running = False
         self._scan_warned = False
         self.scan_returncode = None
 
@@ -154,10 +155,8 @@ class EasyAirApp(MainUI):
         self.btn_mon_toggle.toggled.connect(self._on_mon_toggle)
 
         # 扫描/抓包
-        self.btn_scan.clicked.connect(self._start_scan)
-        self.btn_stop_scan.clicked.connect(self._stop_scan)
+        self.btn_scan.clicked.connect(self._toggle_scan)
         self.btn_capture.clicked.connect(self._start_capture)
-        self.btn_deauth.clicked.connect(self._do_deauth)
 
         # 字典管理
         self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
@@ -167,8 +166,7 @@ class EasyAirApp(MainUI):
         self.btn_change_engine.clicked.connect(self._open_crack_settings)
 
         # 破解控制
-        self.btn_start_crack.clicked.connect(self._start_crack)
-        self.btn_stop_crack.clicked.connect(self._stop_crack)
+        self.btn_start_crack.clicked.connect(self._toggle_crack)
         self.btn_export.clicked.connect(self._export_results)
         self.btn_note.clicked.connect(self._edit_note)
         self.btn_del_record.clicked.connect(self._delete_record)
@@ -579,7 +577,6 @@ class EasyAirApp(MainUI):
 
         self.physical_iface = physical
         self.btn_scan.setEnabled(False)
-        self.btn_stop_scan.setEnabled(True)
         self.btn_scan.setText("⏳ 开启监听中…")
 
         self._run_worker(lambda: self.core.start_monitor(physical),
@@ -607,7 +604,6 @@ class EasyAirApp(MainUI):
         self.log("  · 虚拟机需直通支持监听的 USB 无线网卡")
         self.set_monitor_status("error")
         self.btn_scan.setEnabled(True)
-        self.btn_stop_scan.setEnabled(False)
         self.btn_scan.setText("🔍 扫描")
         self.set_status("监听模式开启失败 · 无法扫描")
 
@@ -725,7 +721,7 @@ class EasyAirApp(MainUI):
             self.scan_elapsed.setText("")
             self._parse_scan_csv(force=True)
             self.btn_scan.setEnabled(True)
-            self.btn_stop_scan.setEnabled(False)
+            self.btn_scan.setEnabled(True)
             self.btn_scan.setText("🔍 扫描")
             self.set_scan_status("idle")
             n = self.ap_table.rowCount()
@@ -799,7 +795,9 @@ class EasyAirApp(MainUI):
                 self.scan_elapsed.setText(self._scan_elapsed_text())
                 n_cli = sum(1 for r in rows if r[8])
                 tip = f", {n_cli} 个有客户端" if n_cli else ""
-                self.set_status(f"发现 {len(rows)} 个 AP{tip} - 双击选择目标")
+                n_hid = getattr(self, "_hidden_ssids", 0)
+                htip = f" · 已隐藏 {n_hid} 个隐藏SSID" if n_hid else ""
+                self.set_status(f"发现 {len(rows)} 个 AP{tip}{htip} - 双击选择目标")
         except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
@@ -856,6 +854,7 @@ class EasyAirApp(MainUI):
             stations_by_bssid = {}
         idx = {}
         rows = []
+        hidden_count = 0
         # airodump 的分隔符是 ", "，引号前多一个空格会使 CSV 规范失效，
         # 含逗号的 SSID(如 "Cafe, Guest") 会被切成两列。先归一化再解析。
         txt = re.sub(r",\s+(?=\")", ",", txt)
@@ -904,7 +903,9 @@ class EasyAirApp(MainUI):
             if not ch:
                 ch = "-"
             if not essid:
-                essid = "(隐藏)"
+                # 隐藏 SSID 不显示(按需求过滤), 但计数保留, 不静默丢失
+                hidden_count += 1
+                continue
             try:
                 pwr_int = int(float(pwr))
                 # airodump 用 -1 表示"尚未收到 beacon, 信号未知",
@@ -928,6 +929,7 @@ class EasyAirApp(MainUI):
                          f"{pwr} dBm" if pwr else "", client_str, client_count))
         # 信号强的排前面(未知信号沉底)
         rows.sort(key=lambda r: (r[0] is None, -(r[0] if r[0] is not None else 0)))
+        self._hidden_ssids = hidden_count
         return rows
 
     @staticmethod
@@ -967,6 +969,20 @@ class EasyAirApp(MainUI):
         self.set_status(f"目标已锁定: {essid} - 点击'抓取握手包'")
 
     # ===== 抓包 =====
+    def _toggle_scan(self):
+        """扫描/停止合并为一个按钮。"""
+        if self.scan_timer.isActive() or self._stopping_scan:
+            self._stop_scan()
+        else:
+            self._start_scan()
+
+    def _toggle_crack(self):
+        """开始破解/停止破解合并为一个按钮。"""
+        if self._crack_running:
+            self._stop_crack()
+        else:
+            self._start_crack()
+
     def _start_capture(self):
         essid = self.lbl_target_essid.text()
         bssid = self.lbl_target_bssid.text()
@@ -981,10 +997,19 @@ class EasyAirApp(MainUI):
 
         self.log(f"[抓包] 目标: {essid} | {bssid} | CH{ch}")
         self.bottom_tabs.setCurrentWidget(self.log_scan_box)
-        self.set_status("正在抓取握手包… 可点击 Deauth 加速")
+        self.set_status("正在抓取握手包…")
 
-        # sudo 校验最长阻塞 5s, 必须放工作线程, 否则界面会假死
+        # deauth 是抓握手包的必要前置: 客户端不会主动重连, 必须先把它踢下线。
+        # 以前要单独点一个按钮, 现在抓包时自动发送。
         def _capture():
+            deauth_note = None
+            if self.mon_iface:
+                dp = self.core.deauth(self.mon_iface, bssid, 10)
+                if dp:
+                    self.log(f"[deauth] 已自动发送 10 次解关联 → {bssid}")
+                    time.sleep(1.5)  # 等客户端开始重连
+                else:
+                    deauth_note = "deauth 发送失败，可能抓不到握手包"
             return self.core.airodump_capture(self.mon_iface, bssid, ch, "handshake")
 
         self._run_worker(_capture, self._on_capture_started)
@@ -1011,27 +1036,6 @@ class EasyAirApp(MainUI):
             self.set_status(f"握手包已捕获 · 可开始破解")
             if hasattr(self, 'cap_check_timer'):
                 self.cap_check_timer.stop()
-
-    def _do_deauth(self):
-        bssid = self.lbl_target_bssid.text()
-        if not bssid or bssid == "未选择":
-            return
-        if not self.mon_iface:
-            self.set_status("监听模式未开启，无法发送 deauth")
-            return
-
-        def _deauth():
-            return self.core.deauth(self.mon_iface, bssid, 10)
-
-        # 同上: sudo 校验会阻塞 GUI
-        self._run_worker(_deauth, self._on_deauth_started)
-
-    def _on_deauth_started(self, p):
-        if not p:
-            self.set_status("Deauth 启动失败")
-            return
-        self.log(f"[deauth] 已发送 10 次解关联 → {self.lbl_target_bssid.text()}")
-        self.deauth_thread = self._spawn_cmd(p, self.log_scan)
 
     def _auto_stop_monitor(self):
         if self.auto_monitor_enabled and self.mon_iface:
@@ -1088,8 +1092,11 @@ class EasyAirApp(MainUI):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.lbl_progress.setText("正在启动破解...")
-        self.btn_start_crack.setEnabled(False)
-        self.btn_stop_crack.setEnabled(True)
+        self.btn_start_crack.setEnabled(True)
+        self.btn_start_crack.setText("⏹ 停止破解")
+        self.btn_start_crack.setStyleSheet(
+            "font-weight: bold; background: #c62828; color: white;")
+        self._crack_running = True
         self.crack_start_time = time.time()
         self.crack_timer.start()
         self.bottom_tabs.setCurrentWidget(self.log_crack_box)
@@ -1196,7 +1203,10 @@ class EasyAirApp(MainUI):
         self.crack_timer.stop()
         self.progress_bar.setVisible(False)
         self.btn_start_crack.setEnabled(True)
-        self.btn_stop_crack.setEnabled(False)
+        self.btn_start_crack.setText("▶ 开始破解")
+        self.btn_start_crack.setStyleSheet(
+            "font-weight: bold; background: #2e7d32; color: white;")
+        self._crack_running = False
 
         tree = getattr(self, 'current_crack_tree', None)
         if tree and self.current_crack_item:
@@ -1210,6 +1220,7 @@ class EasyAirApp(MainUI):
         self.log_crack("[完成] 破解任务结束")
 
     def _stop_crack(self):
+        self._crack_running = False
         if self.crack_thread:
             self.crack_thread.stop()
             self.crack_thread = None
@@ -1219,7 +1230,10 @@ class EasyAirApp(MainUI):
         self.crack_timer.stop()
         self.progress_bar.setVisible(False)
         self.btn_start_crack.setEnabled(True)
-        self.btn_stop_crack.setEnabled(False)
+        self.btn_start_crack.setText("▶ 开始破解")
+        self.btn_start_crack.setStyleSheet(
+            "font-weight: bold; background: #2e7d32; color: white;")
+        self._crack_running = False
         tree = getattr(self, 'current_crack_tree', None)
         if tree and self.current_crack_item:
             tree.set_failed(self.current_crack_item, "已停止")

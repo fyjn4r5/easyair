@@ -468,15 +468,15 @@ class MainUI(QWidget):
 
         ctrl_layout = QHBoxLayout()
         ctrl_layout.setSpacing(6)
+        # 扫描与停止合并为一个切换按钮
         self.btn_scan = QPushButton("🔍 扫描")
-        self.btn_scan.setStyleSheet("font-weight: bold; background: #1976d2; color: white;")
-        self.btn_stop_scan = QPushButton("⏹ 停止")
-        self.btn_stop_scan.setEnabled(False)
+        self.btn_scan.setStyleSheet(
+            "font-weight: bold; background: #1976d2; color: white;")
+        self.btn_scan.setToolTip("点击开始扫描 AP；扫描中点击可随时停止（不关闭监听）")
         self.btn_capture = QPushButton("📡 抓握手包")
         self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
-        self.btn_deauth = QPushButton("💥 Deauth")
-        self.btn_deauth.setToolTip("对目标 AP 发送 deauth，促使客户端重连以便抓握手包")
-        for b in (self.btn_scan, self.btn_stop_scan, self.btn_capture, self.btn_deauth):
+        self.btn_capture.setToolTip("自动对目标 AP 发送 deauth 促使客户端重连，并抓取握手包")
+        for b in (self.btn_scan, self.btn_capture):
             b.setMinimumHeight(32)
             ctrl_layout.addWidget(b)
         ap_group_layout.addLayout(ctrl_layout)
@@ -499,17 +499,17 @@ class MainUI(QWidget):
 
         result_btn_layout = QHBoxLayout()
         result_btn_layout.setSpacing(6)
+        # 开始破解与停止合并为一个切换按钮
         self.btn_start_crack = QPushButton("▶ 开始破解")
-        self.btn_start_crack.setStyleSheet("font-weight: bold; background: #2e7d32; color: white;")
-        self.btn_stop_crack = QPushButton("⏹ 停止")
-        self.btn_stop_crack.setStyleSheet("font-weight: bold; background: #c62828; color: white;")
-        self.btn_stop_crack.setEnabled(False)
+        self.btn_start_crack.setStyleSheet(
+            "font-weight: bold; background: #2e7d32; color: white;")
+        self.btn_start_crack.setToolTip("点击开始破解；破解中点击可随时停止")
         self.btn_note = QPushButton("📝 备注")
         self.btn_note.setToolTip("为选中记录添加备注，如破解地点")
         self.btn_del_record = QPushButton("🗑 删除")
         self.btn_export = QPushButton("📤 导出")
-        for b in (self.btn_start_crack, self.btn_stop_crack,
-                  self.btn_note, self.btn_del_record, self.btn_export):
+        for b in (self.btn_start_crack, self.btn_note,
+                  self.btn_del_record, self.btn_export):
             b.setMinimumHeight(32)
             result_btn_layout.addWidget(b)
         result_layout.addLayout(result_btn_layout)
@@ -736,17 +736,23 @@ class MainUI(QWidget):
     def set_scan_status(self, status: str):
         if status == "idle":
             self.btn_scan.setEnabled(True)
-            self.btn_stop_scan.setEnabled(False)
+            self.btn_scan.setText("🔍 扫描")
+            self.btn_scan.setStyleSheet(
+                "font-weight: bold; background: #1976d2; color: white;")
             self.lbl_scan_status.setPixmap(create_status_icon("#9e9e9e", 20).pixmap(20, 20))
             self.lbl_scan_text.setText("扫描: 空闲")
             self.lbl_scan_text.setStyleSheet("color: #666; min-width: 100px;")
         elif status == "scanning":
-            self.btn_scan.setEnabled(False)
-            self.btn_stop_scan.setEnabled(True)
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("⏹ 停止扫描")
+            self.btn_scan.setStyleSheet(
+                "font-weight: bold; background: #c62828; color: white;")
             self.lbl_scan_status.setPixmap(create_status_icon("#1976d2", 20).pixmap(20, 20))
             self.lbl_scan_text.setText("扫描: 进行中...")
             self.lbl_scan_text.setStyleSheet("color: #1976d2; font-weight: bold; min-width: 100px;")
         elif status == "stopping":
+            self.btn_scan.setEnabled(False)
+            self.btn_scan.setText("⏹ 停止中...")
             self.lbl_scan_text.setText("扫描: 停止中...")
             self.lbl_scan_text.setStyleSheet("color: #f57c00; min-width: 100px;")
 

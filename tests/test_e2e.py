@@ -124,7 +124,7 @@ def main():
     w3 = M.EasyAirApp()
     w3.mon_iface = "wlan0mon"
     w3.btn_scan.setEnabled(True)
-    w3.btn_stop_scan.setEnabled(False)
+    w3.btn_scan.setText("🔍 扫描")
     w3.core.airodump_scan = lambda *a, **k: subprocess.Popen(
         ["sh", "-c", "sleep 30"], stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -134,7 +134,9 @@ def main():
     pump(120)
     check("失败后计时器已停", not w3.scan_timer.isActive())
     check("失败后扫描按钮可点", w3.btn_scan.isEnabled())
-    check("失败后停止按钮禁用", not w3.btn_stop_scan.isEnabled())
+    check("失败后按钮恢复为扫描态", w3.btn_scan.text() == "🔍 扫描",
+          w3.btn_scan.text())
+    check("失败后按钮可用", w3.btn_scan.isEnabled())
     check("失败后按钮文案复位", w3.btn_scan.text() == "🔍 扫描", w3.btn_scan.text())
     check("失败原因写入状态行", "扫描失败" in w3.status_label.text(),
           w3.status_label.text())
@@ -234,9 +236,12 @@ def main():
         "WPA2,AES,-60,-60,LegacyAP,,\n")
     check("旧 17 列格式仍兼容", len(rows2) == 1 and rows2[0][1] == "LegacyAP",
           str(rows2))
-    check("无 SSID 显示隐藏", w._parse_ap_csv(
+    hid = w._parse_ap_csv(
         "BSSID, channel, Privacy, Power, ESSID\n"
-        "33:44:55:66:77:88, 3, WPA2, -60, \n")[0][1] == "(隐藏)")
+        "33:44:55:66:77:88, 3, WPA2, -60, \n")
+    check("隐藏 SSID 不显示", hid == [], str(hid))
+    check("隐藏 SSID 被计数", getattr(w, "_hidden_ssids", 0) == 1,
+          str(getattr(w, "_hidden_ssids", 0)))
     check("状态栏显示 AP 数", "16" in w.status_label.text(), w.status_label.text())
     check("扫描时长标签有内容", "扫描时长" in w.scan_elapsed.text(), w.scan_elapsed.text())
 
@@ -482,7 +487,8 @@ def main():
     check("停止扫描不关闭监听模式", stopped["n"] == 0, f"stop_monitor 调用 {stopped['n']} 次")
     check("停止后监听接口仍保留", w2.mon_iface == "wlan0mon", str(w2.mon_iface))
     check("停止后按钮恢复可点", w2.btn_scan.isEnabled())
-    check("停止后停止按钮禁用", not w2.btn_stop_scan.isEnabled())
+    check("停止后按钮恢复为扫描态", w2.btn_scan.text() == "🔍 扫描",
+          w2.btn_scan.text())
     check("停止后按钮文案复位", w2.btn_scan.text() == "🔍 扫描", w2.btn_scan.text())
 
     section("扫描自动停止")
@@ -704,6 +710,53 @@ def main():
     w._stop_scan()
     check("停止后清空时长", w.scan_elapsed.text() == "",
           repr(w.scan_elapsed.text()))
+
+    section("按钮合并与自动 deauth")
+    check("无独立停止扫描按钮", not hasattr(w, "btn_stop_scan"))
+    check("无独立停止破解按钮", not hasattr(w, "btn_stop_crack"))
+    check("无独立 Deauth 按钮", not hasattr(w, "btn_deauth"))
+    check("扫描为单一按钮", w.btn_scan.text() == "🔍 扫描", w.btn_scan.text())
+    check("破解为单一按钮", w.btn_start_crack.text() == "▶ 开始破解",
+          w.btn_start_crack.text())
+    check("初始未在破解", w._crack_running is False)
+    started = []
+    w._start_scan = lambda: started.append("scan")
+    w._stop_scan = lambda: started.append("stop")
+    w.btn_scan.click()
+    check("空闲时点击=扫描", started == ["scan"], str(started))
+    w.scan_timer.start(9999)
+    w.btn_scan.click()
+    check("扫描中点击=停止", started == ["scan", "stop"], str(started))
+    w.scan_timer.stop()
+    cstart = []
+    w._start_crack = lambda: cstart.append("start")
+    w._stop_crack = lambda: cstart.append("stop")
+    w.btn_start_crack.click()
+    check("未破解时点击=开始", cstart == ["start"], str(cstart))
+    w._crack_running = True
+    w.btn_start_crack.click()
+    check("破解中点击=停止", cstart == ["start", "stop"], str(cstart))
+    w._crack_running = False
+
+    section("隐藏 SSID 过滤")
+    csv.write_text(
+        hdr + "\n"
+        "AA:BB:CC:DD:EE:01, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -40,  4,  0,   0.  0.  0.  0,   3, Visible, \n"
+        "AA:BB:CC:DD:EE:02, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -50,  4,  0,   0.  0.  0.  0,   3, , \n"
+        "AA:BB:CC:DD:EE:03, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -60,  4,  0,   0.  0.  0.  0,   3, , \n")
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    check("隐藏 SSID 行被过滤", w.ap_table.rowCount() == 1,
+          str(w.ap_table.rowCount()))
+    check("只显示有名字的 AP",
+          w.ap_table.item(0, 1).text() == "Visible", w.ap_table.item(0, 1).text())
+    check("隐藏数量为 2", getattr(w, "_hidden_ssids", 0) == 2,
+          str(getattr(w, "_hidden_ssids", 0)))
+    check("状态栏提示隐藏数量", "已隐藏 2" in w.status_label.text(),
+          w.status_label.text())
 
     section("关闭时清理线程")
     w2.close()
