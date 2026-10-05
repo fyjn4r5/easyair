@@ -4,15 +4,27 @@ from PyQt5.QtWidgets import (
     QSplitter, QFileDialog, QMessageBox, QCheckBox, QListWidget,
     QListWidgetItem, QAbstractItemView, QMenu, QAction, QInputDialog,
     QLineEdit, QSpinBox, QDialog, QDialogButtonBox, QFormLayout,
-    QTabWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QFrame
+    QTabWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QFrame,
+    QSystemTrayIcon, QStyle
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
 from pathlib import Path
 
 
+def create_status_icon(color: str, size: int = 16) -> QIcon:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor(color))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(2, 2, size - 4, size - 4)
+    painter.end()
+    return QIcon(pixmap)
+
+
 class WordListDialog(QDialog):
-    """字典管理对话框"""
     def __init__(self, parent=None, current_lists=None):
         super().__init__(parent)
         self.setWindowTitle("字典管理")
@@ -24,7 +36,6 @@ class WordListDialog(QDialog):
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # 列表
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.list_widget.setDragDropMode(QAbstractItemView.InternalMove)
@@ -33,7 +44,6 @@ class WordListDialog(QDialog):
         self.list_widget.customContextMenuRequested.connect(self._show_menu)
         layout.addWidget(self.list_widget)
 
-        # 按钮栏
         btn_layout = QHBoxLayout()
         self.btn_add_files = QPushButton("添加文件")
         self.btn_add_dir = QPushButton("添加目录")
@@ -46,13 +56,11 @@ class WordListDialog(QDialog):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        # 对话框按钮
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        # 信号
         self.btn_add_files.clicked.connect(self._add_files)
         self.btn_add_dir.clicked.connect(self._add_dir)
         self.btn_remove.clicked.connect(self._remove_selected)
@@ -125,7 +133,6 @@ class WordListDialog(QDialog):
 
 
 class CrackResultWidget(QTreeWidget):
-    """破解结果显示 - 类似 EWSA 风格"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setHeaderLabels(["BSSID", "ESSID", "密码", "握手包", "状态", "耗时"])
@@ -139,14 +146,12 @@ class CrackResultWidget(QTreeWidget):
         self.setRootIsDecorated(False)
 
     def add_target(self, bssid, essid, cap_file):
-        """添加破解目标"""
         item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00"])
         item.setData(0, Qt.UserRole, {"bssid": bssid, "essid": essid, "cap": cap_file})
         self.addTopLevelItem(item)
         return item
 
     def update_progress(self, item, password, elapsed):
-        """更新破解进度"""
         if password:
             item.setText(2, password)
             item.setText(4, "成功")
@@ -162,11 +167,22 @@ class CrackResultWidget(QTreeWidget):
 
 
 class MainUI(QWidget):
+    monitor_status_changed = pyqtSignal(str)
+    scan_status_changed = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("EasyAir - WiFi 抓包破解 (EWSA 风格)")
         self.resize(1400, 850)
+        
+        self.icon_on = create_status_icon("#2e7d32")
+        self.icon_off = create_status_icon("#9e9e9e")
+        self.icon_starting = create_status_icon("#f57c00")
+        self.icon_error = create_status_icon("#c62828")
+        self.icon_scanning = create_status_icon("#1976d2")
+        
         self._setup_ui()
+        self._setup_tray()
 
     def _setup_ui(self):
         root = QVBoxLayout(self)
@@ -180,7 +196,6 @@ class MainUI(QWidget):
         tb_layout = QHBoxLayout(toolbar)
         tb_layout.setContentsMargins(10, 5, 10, 5)
 
-        # 网卡选择
         tb_layout.addWidget(QLabel("网卡:"))
         self.iface_combo = QComboBox()
         self.iface_combo.setMinimumWidth(180)
@@ -189,21 +204,53 @@ class MainUI(QWidget):
         self.btn_refresh_iface = QPushButton("刷新")
         tb_layout.addWidget(self.btn_refresh_iface)
 
+        tb_layout.addSpacing(10)
+
+        # 监听模式状态指示器 (带图标的按钮) - 关键：补回这个按钮
+        self.btn_mon_toggle = QPushButton()
+        self.btn_mon_toggle.setCheckable(True)
+        self.btn_mon_toggle.setFixedSize(40, 40)
+        self.btn_mon_toggle.setIcon(self.icon_off)
+        self.btn_mon_toggle.setIconSize(QSize(24, 24))
+        self.btn_mon_toggle.setToolTip("监听模式: 关闭\n点击开启/关闭")
+        self.btn_mon_toggle.setStyleSheet("""
+            QPushButton {
+                border: 2px solid #ddd;
+                border-radius: 20px;
+                background: #fafafa;
+            }
+            QPushButton:checked {
+                border: 2px solid #2e7d32;
+                background: #e8f5e9;
+            }
+            QPushButton:hover {
+                background: #f5f5f5;
+            }
+        """)
+        tb_layout.addWidget(self.btn_mon_toggle)
+
+        self.lbl_mon_status = QLabel("监听模式: 关闭")
+        self.lbl_mon_status.setStyleSheet("color: #9e9e9e; font-weight: bold; min-width: 120px;")
+        tb_layout.addWidget(self.lbl_mon_status)
+
         tb_layout.addSpacing(20)
 
-        # 自动模式指示
-        self.lbl_auto = QLabel("🔄 全自动模式: 扫描→抓包→破解")
-        self.lbl_auto.setStyleSheet("color: #2e7d32; font-weight: bold;")
-        tb_layout.addWidget(self.lbl_auto)
+        self.lbl_scan_status = QLabel()
+        self.lbl_scan_status.setFixedSize(20, 20)
+        self.lbl_scan_status.setPixmap(create_status_icon("#9e9e9e", 20).pixmap(20, 20))
+        self.lbl_scan_status.setToolTip("扫描状态: 空闲")
+        tb_layout.addWidget(self.lbl_scan_status)
+
+        self.lbl_scan_text = QLabel("扫描: 空闲")
+        self.lbl_scan_text.setStyleSheet("color: #666; min-width: 100px;")
+        tb_layout.addWidget(self.lbl_scan_text)
 
         tb_layout.addStretch()
 
-        # 字典管理按钮
         self.btn_dict_mgr = QPushButton("📁 字典管理")
         self.btn_dict_mgr.setMinimumWidth(100)
         tb_layout.addWidget(self.btn_dict_mgr)
 
-        # 破解设置按钮
         self.btn_crack_cfg = QPushButton("⚙ 破解设置")
         self.btn_crack_cfg.setMinimumWidth(100)
         tb_layout.addWidget(self.btn_crack_cfg)
@@ -219,7 +266,6 @@ class MainUI(QWidget):
         left_layout.setSpacing(6)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        # AP 表格
         ap_group = QGroupBox("周边 AP (双击选择目标)")
         ap_layout = QVBoxLayout(ap_group)
 
@@ -235,14 +281,13 @@ class MainUI(QWidget):
         self.ap_table.setSelectionMode(QAbstractItemView.SingleSelection)
         ap_layout.addWidget(self.ap_table)
 
-        # 扫描/抓包控制
         ctrl_layout = QHBoxLayout()
         self.btn_scan = QPushButton("🔍 开始扫描")
-        print(f"DEBUG: Created btn_scan: {self.btn_scan}")
         self.btn_scan.setMinimumHeight(36)
         self.btn_scan.setStyleSheet("font-weight: bold; background: #1976d2; color: white;")
         self.btn_stop_scan = QPushButton("⏹ 停止扫描")
         self.btn_stop_scan.setMinimumHeight(36)
+        self.btn_stop_scan.setEnabled(False)
         self.btn_capture = QPushButton("📡 抓取握手包")
         self.btn_capture.setMinimumHeight(36)
         self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
@@ -254,14 +299,12 @@ class MainUI(QWidget):
         ctrl_layout.addWidget(self.btn_deauth)
         ap_layout.addLayout(ctrl_layout)
 
-        # 状态栏
         self.status_label = QLabel("就绪 - 点击'开始扫描'搜索周边 AP")
         self.status_label.setStyleSheet("color: #666; padding: 4px;")
         ap_layout.addWidget(self.status_label)
 
         left_layout.addWidget(ap_group)
 
-        # 当前目标信息
         target_group = QGroupBox("当前目标")
         target_layout = QFormLayout(target_group)
         self.lbl_target_essid = QLabel("未选择")
@@ -285,7 +328,6 @@ class MainUI(QWidget):
         right_layout.setSpacing(6)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 破解引擎选择
         engine_group = QGroupBox("破解引擎")
         engine_layout = QHBoxLayout(engine_group)
         engine_layout.addWidget(QLabel("引擎:"))
@@ -299,11 +341,10 @@ class MainUI(QWidget):
         engine_layout.addStretch()
         right_layout.addWidget(engine_group)
 
-        # 破解进度
         progress_group = QGroupBox("破解进度")
         progress_layout = QVBoxLayout(progress_group)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # 不定进度
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         progress_layout.addWidget(self.progress_bar)
         self.lbl_progress = QLabel("等待开始...")
@@ -311,13 +352,11 @@ class MainUI(QWidget):
         progress_layout.addWidget(self.lbl_progress)
         right_layout.addWidget(progress_group)
 
-        # 破解结果列表 (核心 - EWSA 风格)
         result_group = QGroupBox("破解结果")
         result_layout = QVBoxLayout(result_group)
         self.crack_result = CrackResultWidget()
         result_layout.addWidget(self.crack_result)
 
-        # 结果操作按钮
         result_btn_layout = QHBoxLayout()
         self.btn_start_crack = QPushButton("▶ 开始破解")
         self.btn_start_crack.setMinimumHeight(40)
@@ -325,6 +364,7 @@ class MainUI(QWidget):
         self.btn_stop_crack = QPushButton("⏹ 停止破解")
         self.btn_stop_crack.setMinimumHeight(40)
         self.btn_stop_crack.setStyleSheet("font-weight: bold; background: #c62828; color: white; font-size: 14px;")
+        self.btn_stop_crack.setEnabled(False)
         self.btn_export = QPushButton("📤 导出结果")
         result_btn_layout.addWidget(self.btn_start_crack)
         result_btn_layout.addWidget(self.btn_stop_crack)
@@ -348,3 +388,94 @@ class MainUI(QWidget):
         self.log_box.setFont(QFont("Monospace", 9))
         log_layout.addWidget(self.log_box)
         root.addWidget(log_group)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.icon_off)
+        self.tray_icon.setToolTip("EasyAir - 监听模式: 关闭")
+        
+        tray_menu = QMenu()
+        self.tray_action_mon = QAction("监听模式: 关闭", self)
+        self.tray_action_mon.setEnabled(False)
+        tray_menu.addAction(self.tray_action_mon)
+        tray_menu.addSeparator()
+        act_show = QAction("显示主界面", self)
+        act_show.triggered.connect(self.showNormal)
+        tray_menu.addAction(act_show)
+        act_quit = QAction("退出", self)
+        act_quit.triggered.connect(QApplication.instance().quit)
+        tray_menu.addAction(act_quit)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def set_monitor_status(self, status: str):
+        if status == "off":
+            self.btn_mon_toggle.setChecked(False)
+            self.btn_mon_toggle.setIcon(self.icon_off)
+            self.btn_mon_toggle.setToolTip("监听模式: 关闭\n点击开启")
+            self.lbl_mon_status.setText("监听模式: 关闭")
+            self.lbl_mon_status.setStyleSheet("color: #9e9e9e; font-weight: bold; min-width: 120px;")
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.setIcon(self.icon_off)
+                self.tray_icon.setToolTip("EasyAir - 监听模式: 关闭")
+                self.tray_action_mon.setText("监听模式: 关闭")
+        elif status == "starting":
+            self.btn_mon_toggle.setIcon(self.icon_starting)
+            self.btn_mon_toggle.setToolTip("监听模式: 启动中...")
+            self.lbl_mon_status.setText("监听模式: 启动中...")
+            self.lbl_mon_status.setStyleSheet("color: #f57c00; font-weight: bold; min-width: 120px;")
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.setIcon(self.icon_starting)
+                self.tray_icon.setToolTip("EasyAir - 监听模式: 启动中...")
+        elif status == "on":
+            self.btn_mon_toggle.setChecked(True)
+            self.btn_mon_toggle.setIcon(self.icon_on)
+            self.btn_mon_toggle.setToolTip("监听模式: 已开启\n点击关闭")
+            self.lbl_mon_status.setText("监听模式: 已开启")
+            self.lbl_mon_status.setStyleSheet("color: #2e7d32; font-weight: bold; min-width: 120px;")
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.setIcon(self.icon_on)
+                self.tray_icon.setToolTip("EasyAir - 监听模式: 已开启")
+                self.tray_action_mon.setText("监听模式: 已开启")
+        elif status == "error":
+            self.btn_mon_toggle.setChecked(False)
+            self.btn_mon_toggle.setIcon(self.icon_error)
+            self.btn_mon_toggle.setToolTip("监听模式: 错误")
+            self.lbl_mon_status.setText("监听模式: 错误")
+            self.lbl_mon_status.setStyleSheet("color: #c62828; font-weight: bold; min-width: 120px;")
+            if hasattr(self, 'tray_icon'):
+                self.tray_icon.setIcon(self.icon_error)
+                self.tray_icon.setToolTip("EasyAir - 监听模式: 错误")
+
+    def set_scan_status(self, status: str):
+        if status == "idle":
+            self.btn_scan.setEnabled(True)
+            self.btn_stop_scan.setEnabled(False)
+            self.lbl_scan_status.setPixmap(create_status_icon("#9e9e9e", 20).pixmap(20, 20))
+            self.lbl_scan_text.setText("扫描: 空闲")
+            self.lbl_scan_text.setStyleSheet("color: #666; min-width: 100px;")
+        elif status == "scanning":
+            self.btn_scan.setEnabled(False)
+            self.btn_stop_scan.setEnabled(True)
+            self.lbl_scan_status.setPixmap(create_status_icon("#1976d2", 20).pixmap(20, 20))
+            self.lbl_scan_text.setText("扫描: 进行中...")
+            self.lbl_scan_text.setStyleSheet("color: #1976d2; font-weight: bold; min-width: 100px;")
+        elif status == "stopping":
+            self.lbl_scan_text.setText("扫描: 停止中...")
+            self.lbl_scan_text.setStyleSheet("color: #f57c00; min-width: 100px;")
+
+    def closeEvent(self, event):
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.hide()
+        super().closeEvent(event)
