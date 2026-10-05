@@ -268,7 +268,30 @@ class EasyAirApp(MainUI):
         self._last_csv = csv
         try:
             txt = csv.read_text(errors="ignore")
-            ap_sec = txt.split("Station MAC")[0] if "Station MAC" in txt else txt
+            
+            # 分离 AP 部分和 Station 部分
+            if "Station MAC" in txt:
+                ap_sec, station_sec = txt.split("Station MAC", 1)
+            else:
+                ap_sec, station_sec = txt, ""
+            
+            # 解析 Station 部分：按 BSSID 分组客户端
+            stations_by_bssid = {}
+            for line in station_sec.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("Station MAC", "Interface")):
+                    continue
+                parts = re.split(r',\s*', line)
+                if len(parts) >= 6:
+                    station_mac = parts[0]
+                    bssid = parts[5]
+                    power = parts[3]
+                    packets = parts[4]
+                    stations_by_bssid.setdefault(bssid, []).append({
+                        'mac': station_mac, 'power': power, 'packets': packets
+                    })
+            
+            # 解析 AP 部分并合并客户端信息
             rows = []
             for line in ap_sec.splitlines():
                 line = line.strip()
@@ -277,10 +300,26 @@ class EasyAirApp(MainUI):
                 parts = re.split(r',\s*', line)
                 if len(parts) < 14:
                     continue
-                bssid, ch, priv, cipher, auth, pwr = parts[0], parts[3], parts[5], parts[6], parts[7], parts[8]
+                bssid = parts[0]
+                ch = parts[3].strip()
+                priv = parts[5].strip()
+                cipher = parts[6].strip()
+                auth = parts[7].strip()
+                pwr = parts[8].strip()
                 essid = ','.join(parts[13:]).strip().strip('"')
                 if not bssid:
                     continue
+                
+                # 客户端信息
+                clients = stations_by_bssid.get(bssid, [])
+                client_count = len(clients)
+                client_str = f"{client_count}客户端"
+                if clients:
+                    client_macs = ', '.join([c['mac'] for c in clients[:3]])
+                    if len(clients) > 3:
+                        client_macs += f" 等{len(clients)}个"
+                    client_str = f"{client_count}客户端: {client_macs}"
+                
                 try:
                     pwr_int = int(pwr)
                     if pwr_int >= -50:
@@ -291,16 +330,23 @@ class EasyAirApp(MainUI):
                         sig = "📶"
                 except ValueError:
                     sig = "📶"
-                rows.append((sig, essid or "(隐藏)", bssid, ch.strip(), f"{priv}/{cipher}", auth.strip(), pwr))
+                
+                rows.append((sig, essid or "(隐藏)", bssid, ch, f"{priv}/{cipher}", auth.strip(), pwr, client_str))
+            
             if rows:
                 self.ap_table.setRowCount(0)
+                self.ap_table.setColumnCount(8)
+                self.ap_table.setHorizontalHeaderLabels(["信号", "SSID", "BSSID", "信道", "加密", "认证", "信号强度", "客户端"])
+                self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
                 for r in rows:
                     i = self.ap_table.rowCount()
                     self.ap_table.insertRow(i)
                     for c, v in enumerate(r):
                         self.ap_table.setItem(i, c, QTableWidgetItem(v))
                 self.log(f"[解析] 更新 AP 列表: {len(rows)} 个")
-                self.set_status(f"发现 {len(rows)} 个 AP - 双击选择目标")
+                # 统计有客户端的 AP 数
+                ap_with_clients = sum(1 for r in rows if r[7] != "0客户端")
+                self.set_status(f"发现 {len(rows)} 个 AP，{ap_with_clients} 个有客户端 - 双击选择目标")
         except (OSError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
