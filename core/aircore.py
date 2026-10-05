@@ -3,6 +3,7 @@ import re
 import json
 import subprocess
 import shlex
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -73,37 +74,39 @@ class AirCore:
         self.save_config()
 
     def _get_sudo_password(self) -> Optional[str]:
-        """尝试从 ~/.Pas 读取密码（简单加密或明文），失败返回 None"""
         if self._sudo_password:
             return self._sudo_password
         if PAS_FILE.exists():
             try:
                 content = PAS_FILE.read_text(encoding='utf-8', errors='ignore').strip()
-                # 简单尝试：如果是 base64 解码
                 import base64
                 try:
                     decoded = base64.b64decode(content).decode('utf-8')
                     self._sudo_password = decoded.strip()
                     return self._sudo_password
                 except Exception:
-                    # 当作明文
                     self._sudo_password = content
                     return self._sudo_password
             except Exception:
                 pass
         return None
 
+    def _run_sudo_cmd(self, cmd: str) -> subprocess.Popen:
+        """统一执行 sudo 命令，自动处理密码"""
+        pwd = self._get_sudo_password()
+        if pwd:
+            full_cmd = f"echo '{pwd}' | sudo -S {cmd}"
+        else:
+            full_cmd = f"pkexec {cmd}"
+        return subprocess.Popen(shlex.split(full_cmd), stdout=subprocess.PIPE, 
+                                stderr=subprocess.STDOUT, text=True, bufsize=1, 
+                                encoding='utf-8', errors='replace')
+
     def run_cmd(self, cmd: str, sudo: bool = False, shell: bool = False):
-        if sudo and not str(cmd).startswith(("pkexec", "sudo")):
-            pwd = self._get_sudo_password()
-            if pwd:
-                # 使用 sudo -S 从 stdin 读取密码
-                cmd = f"echo '{pwd}' | sudo -S {cmd}"
-            else:
-                cmd = f"pkexec {cmd}"
+        if sudo:
+            return self._run_sudo_cmd(cmd)
         if not shell and isinstance(cmd, str):
             cmd = shlex.split(cmd)
-        # 使用 locale 编码防止中文乱码
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                 text=True, bufsize=1, encoding='utf-8', errors='replace')
 
@@ -117,6 +120,7 @@ class AirCore:
             return []
 
     def get_monitor_interface(self, iface: str) -> Optional[str]:
+        """获取对应的监听模式接口名"""
         try:
             res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace')
             for line in res.stdout.splitlines():
@@ -129,33 +133,94 @@ class AirCore:
             pass
         return f"{iface}mon"
 
-    def start_monitor(self, iface: str):
-        self.log(f"[监听模式] 开启: {iface}")
-        p = self.run_cmd(f"airmon-ng start {iface}", sudo=True)
-        return p
-
-    def stop_monitor(self, mon_iface: str):
-        self.log(f"[监听模式] 关闭: {mon_iface}")
-        p = self.run_cmd(f"airmon-ng stop {mon_iface}", sudo=True)
-        return p
-
     def check_monitor_mode(self, iface: str) -> bool:
+        """检查接口是否已在监听模式"""
         try:
             res = subprocess.run(["iwconfig", iface], capture_output=True, text=True, encoding='utf-8', errors='replace')
             return "Mode:Monitor" in res.stdout
         except Exception:
             return False
 
+    def _cleanup_monitor(self, iface: str):
+        """清理可能残留的监听接口"""
+        mon = self.get_monitor_interface(iface)
+        if mon and mon != iface:
+            try:
+                subprocess.run(["sudo", "airmon-ng", "stop", mon], capture_output=True, timeout=5)
+            except Exception:
+                pass
+        # 也尝试直接 stop 物理接口
+        try:
+            subprocess.run(["sudo", "airmon-ng", "stop", iface], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def start_monitor(self, iface: str):
+        """开启监听模式，返回监听接口名"""
+        self.log(f"[监听模式] 准备开启: {iface}")
+        
+        # 1. 先清理残留
+        self._cleanup_monitor(iface)
+        time.sleep(0.5)
+        
+        # 2. 检查是否已经在监听模式
+        if self.check_monitor_mode(iface):
+            self.log(f"[监听模式] {iface} 已经是 Monitor 模式")
+            return subprocess.Popen(["echo", "already_monitor"], stdout=subprocess.PIPE, text=True)
+        
+        # 3. 杀掉干扰进程
+        self._run_sudo_cmd("airmon-ng check kill").wait()
+        
+        # 4. 启动监听模式
+        self.log(f"[监听模式] 执行: airmon-ng start {iface}")
+        p = self._run_sudo_cmd(f"airmon-ng start {iface}")
+        return p
+
+    def stop_monitor(self, mon_iface: str):
+        """关闭监听模式"""
+        self.log(f"[监听模式] 关闭: {mon_iface}")
+        p = self._run_sudo_cmd(f"airmon-ng stop {mon_iface}")
+        return p
+
     def ensure_monitor(self, iface: str) -> Tuple[bool, str]:
+        """确保接口在监听模式，返回(成功, 监听接口名)"""
+        # 先清理
+        self._cleanup_monitor(iface)
+        time.sleep(0.3)
+        
+        # 检查物理接口是否已是监听模式
         if self.check_monitor_mode(iface):
             return True, iface
+        
+        # 启动
         p = self.start_monitor(iface)
-        for _ in p.stdout:
-            pass
+        # 等待完成，最多 10 秒
+        start_time = time.time()
+        output_lines = []
+        while time.time() - start_time < 10:
+            line = p.stdout.readline()
+            if not line and p.poll() is not None:
+                break
+            if line:
+                output_lines.append(line.strip())
+                self.log(line.strip())
+            time.sleep(0.1)
         p.wait()
+        
+        # 查找生成的监听接口
         mon = self.get_monitor_interface(iface)
         if mon and self.check_monitor_mode(mon):
             return True, mon
+        
+        # 兜底：从输出中提取
+        for line in output_lines:
+            if "monitor mode enabled" in line.lower():
+                match = re.search(r'(\w+mon\d*)', line)
+                if match:
+                    mon = match.group(1)
+                    if self.check_monitor_mode(mon):
+                        return True, mon
+        
         return False, ""
 
     def airodump_scan(self, mon_iface: str, outfile_prefix: str = "scan"):
