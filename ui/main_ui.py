@@ -243,10 +243,22 @@ class CrackSettingsDialog(QDialog):
         self.scan_secs.setValue(int(config.get("scan_auto_stop", 0) or 0))
         form.addRow("扫描自动停止:", self.scan_secs)
 
+        self.temp_limit = QSpinBox()
+        self.temp_limit.setRange(0, 110)
+        self.temp_limit.setSingleStep(5)
+        self.temp_limit.setSuffix(" °C")
+        self.temp_limit.setSpecialValueText("不限制")
+        self.temp_limit.setValue(int(config.get("hashcat_temp_limit", 85) or 0))
+        self.temp_limit.setToolTip(
+            "GPU 温度达到该值时 hashcat 自动中止，防止硬件过热损坏。\n"
+            "常见显卡的安全上限约 83~90 °C，默认 85 °C。0 表示不限制。")
+        form.addRow("GPU 温度上限:", self.temp_limit)
+
         layout.addLayout(form)
 
         hint = QLabel("提示: Aircrack-ng 仅支持 CPU，切换引擎时设备会自动锁定。\n"
-                      "停止扫描不会关闭监听模式，可直接继续抓取握手包。")
+                      "停止扫描不会关闭监听模式，可直接继续抓取握手包。\n"
+                      "所有设置保存后立即生效，重启后仍然保留。")
         hint.setStyleSheet("color: #888;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -273,6 +285,7 @@ class CrackSettingsDialog(QDialog):
             "hashcat_extra_args": self.extra_args.text().strip(),
             "auto_monitor": self.auto_mon.isChecked(),
             "scan_auto_stop": self.scan_secs.value(),
+            "hashcat_temp_limit": self.temp_limit.value(),
         }
 
 
@@ -409,16 +422,15 @@ class MainUI(QWidget):
         self.lbl_progress.setStyleSheet("color: #607d8b;")
         self.lbl_progress.setFixedWidth(150)
         tgt_layout.addWidget(self.lbl_progress)
-        self.scan_elapsed = QLabel("")
-        self.scan_elapsed.setStyleSheet("color: #90a4ae;")
-        self.scan_elapsed.setFixedWidth(190)
-        tgt_layout.addWidget(self.scan_elapsed)
 
         root.addWidget(target_bar)
 
         # ===== 中部: 左右对称, 两个表格等宽等高 =====
         main_splitter = QSplitter(Qt.Horizontal)
         main_splitter.setChildrenCollapsible(False)
+        # 两个 QTableWidget 实时重排非常昂贵, 改为松手后才重排
+        main_splitter.setOpaqueResize(True)
+        main_splitter.setHandleWidth(6)
 
         # ---- 左侧: 周边 AP ----
         ap_group = QGroupBox("周边 AP  ·  双击设为目标")
@@ -441,6 +453,15 @@ class MainUI(QWidget):
         self.ap_table.setShowGrid(False)
         self.ap_table.verticalHeader().setVisible(False)
         self.ap_table.setWordWrap(False)
+        # 拖动变卡的主因: 纵向表头默认 Interactive, 每次布局都要逐行重算
+        # sizeHint。固定行高 + 按像素滚动后, 拖动/滚动不再触发行级重排。
+        _ap_vh = self.ap_table.verticalHeader()
+        _ap_vh.setSectionResizeMode(QHeaderView.Fixed)
+        _ap_vh.setDefaultSectionSize(26)
+        self.ap_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.ap_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.ap_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.ap_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.ap_table.setSelectionMode(QAbstractItemView.SingleSelection)
         ap_group_layout.addWidget(self.ap_table, 1)
 
@@ -468,6 +489,11 @@ class MainUI(QWidget):
         result_layout.setSpacing(6)
         self.result_tabs = QTabWidget()
         self.result_tabs.setDocumentMode(True)
+        # 历史日期 tab 过多时会被压缩并把日期省略成 "2026-10-…",
+        # 改为按需出现滚动按钮且不省略, 保证日期始终完整可见
+        self.result_tabs.setUsesScrollButtons(True)
+        self.result_tabs.tabBar().setElideMode(Qt.ElideNone)
+        self.result_tabs.tabBar().setExpanding(False)
         result_layout.addWidget(self.result_tabs, 1)
 
         result_btn_layout = QHBoxLayout()
@@ -495,6 +521,8 @@ class MainUI(QWidget):
         # ===== 竖向分割: 上下可拖拽 =====
         body_splitter = QSplitter(Qt.Vertical)
         body_splitter.setChildrenCollapsible(False)
+        body_splitter.setOpaqueResize(True)
+        body_splitter.setHandleWidth(6)
         body_splitter.addWidget(main_splitter)
         body_splitter.addWidget(self._build_bottom_tabs())
         body_splitter.setStretchFactor(0, 5)
@@ -513,6 +541,13 @@ class MainUI(QWidget):
         self.status_label.setStyleSheet("color: #455a64;")
         st_layout.addWidget(self.status_label)
         st_layout.addStretch()
+        # 扫描时长与倒计时放在底部任务栏, 不占用顶部空间
+        self.scan_elapsed = QLabel("")
+        self.scan_elapsed.setStyleSheet("color: #607d8b;")
+        self.scan_elapsed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.scan_elapsed.setMinimumWidth(230)
+        self.scan_elapsed.setToolTip("扫描时长与自动停止倒计时")
+        st_layout.addWidget(self.scan_elapsed)
         root.addWidget(status_line)
 
         self.setStyleSheet(self._app_stylesheet())
@@ -542,6 +577,9 @@ class MainUI(QWidget):
         cap_header.setSectionResizeMode(QHeaderView.Interactive)
         cap_header.setStretchLastSection(False)
         self.cap_tree.setColumnWidth(0, 460)
+        self.cap_tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        _cap_vh = self.cap_tree.header()
+        _cap_vh.setSectionResizeMode(QHeaderView.Fixed)
         self.cap_tree.setColumnWidth(1, 90)
         self.cap_tree.setAlternatingRowColors(True)
         self.cap_tree.setRootIsDecorated(True)
