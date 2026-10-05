@@ -58,10 +58,17 @@ jobs:
           app = QApplication([])
           win = ui.main_ui.MainUI()
           print('MainUI created OK')
-          print('Has btn_mon_toggle:', hasattr(win, 'btn_mon_toggle'))
-          print('Has btn_scan:', hasattr(win, 'btn_scan'))
+          print('Log tabs:', win.log_tabs.count())
+          print('Result tabs:', win.result_tabs.count())
+          print('Cap tree:', hasattr(win, 'cap_tree'))
+          print('Engine label:', hasattr(win, 'lbl_engine'))
           print('All modules OK')
           "
+
+      - name: Run offline E2E tests
+        run: |
+          source .venv/bin/activate
+          QT_QPA_PLATFORM=offscreen python3 tests/test_e2e.py
 
       - name: Build with PyInstaller
         run: |
@@ -104,7 +111,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/easyair
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ steps.vars.outputs.VERSION }}
           name: EasyAir ${{ steps.vars.outputs.VERSION }}
           body: |
             **EasyAir** - 傻瓜式 WiFi 抓包破解工具 (Mint 21.3 / Ubuntu 22.04+)

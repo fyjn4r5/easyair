@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 CONFIG_FILE = Path(__file__).parent.parent / "config" / "settings.json"
+HISTORY_FILE = Path(__file__).parent.parent / "config" / "history.json"
 PAS_FILE = Path.home() / ".Pas"
+
+import datetime
+
+
+def today_str() -> str:
+    return datetime.date.today().isoformat()
 
 class AirCore:
     def __init__(self, base_dir: Path):
@@ -29,6 +36,8 @@ class AirCore:
             "use_gpu": True,
             "hashcat_extra_args": "",
             "auto_monitor": True,
+            "crack_engine": "Hashcat (GPU/CPU)",
+            "crack_device": "GPU + CPU (自动)",
         }
         if CONFIG_FILE.exists():
             try:
@@ -73,6 +82,64 @@ class AirCore:
     def set_hashcat_extra_args(self, args: str):
         self.config["hashcat_extra_args"] = args
         self.save_config()
+
+    # ===== 历史记录（按日期归类）=====
+    def load_history(self) -> dict:
+        if not HISTORY_FILE.exists():
+            return {}
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def save_history(self, data: dict):
+        try:
+            with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[历史保存失败] {e}")
+
+    def history_dates(self) -> List[str]:
+        return sorted(self.load_history().keys(), reverse=True)
+
+    def history_records(self, date: str) -> List[dict]:
+        return self.load_history().get(date, [])
+
+    def history_add(self, date: str, record: dict):
+        data = self.load_history()
+        data.setdefault(date, []).append(record)
+        self.save_history(data)
+
+    def history_update(self, date: str, index: int, record: dict):
+        data = self.load_history()
+        if date in data and 0 <= index < len(data[date]):
+            data[date][index] = record
+            self.save_history(data)
+
+    def history_delete(self, date: str, index: int) -> bool:
+        data = self.load_history()
+        if date in data and 0 <= index < len(data[date]):
+            data[date].pop(index)
+            if not data[date]:
+                data.pop(date)
+            self.save_history(data)
+            return True
+        return False
+
+    def list_handshakes(self) -> List[Tuple[str, Path, int]]:
+        """按日期倒序返回 (日期, 路径, 大小)"""
+        out = []
+        for cap in self.caps_dir.glob("handshake*.cap"):
+            try:
+                st = cap.stat()
+            except OSError:
+                continue
+            day = datetime.date.fromtimestamp(st.st_mtime).isoformat()
+            out.append((day, cap, st.st_size, st.st_mtime))
+        out.sort(key=lambda x: (x[0], x[3]), reverse=True)
+        return [(d, p, s) for d, p, s, _ in out]
 
     def _get_sudo_password(self) -> Optional[str]:
         if self._sudo_password:

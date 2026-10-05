@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QAbstractItemView, QMenu, QAction, QInputDialog,
     QLineEdit, QSpinBox, QDialog, QDialogButtonBox, QFormLayout,
     QTabWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QFrame,
-    QSystemTrayIcon, QStyle, QApplication
+    QSystemTrayIcon, QStyle, QApplication, QPlainTextEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
@@ -133,37 +133,137 @@ class WordListDialog(QDialog):
 
 
 class CrackResultWidget(QTreeWidget):
+    COL_BSSID, COL_ESSID, COL_PWD, COL_CAP, COL_STATE, COL_TIME, COL_NOTE = range(7)
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setHeaderLabels(["BSSID", "ESSID", "密码", "握手包", "状态", "耗时"])
-        self.setColumnWidth(0, 180)
-        self.setColumnWidth(1, 150)
-        self.setColumnWidth(2, 180)
-        self.setColumnWidth(3, 200)
-        self.setColumnWidth(4, 80)
-        self.setColumnWidth(5, 80)
+        self.setHeaderLabels(["BSSID", "SSID", "密码", "握手包", "状态", "耗时", "备注"])
+        header = self.header()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(True)
+        for idx, w in enumerate((170, 130, 160, 180, 80, 80, 150)):
+            self.setColumnWidth(idx, w)
         self.setAlternatingRowColors(True)
         self.setRootIsDecorated(False)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
-    def add_target(self, bssid, essid, cap_file):
-        item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00"])
+    def add_target(self, bssid, essid, cap_file, note=""):
+        item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00", note])
         item.setData(0, Qt.UserRole, {"bssid": bssid, "essid": essid, "cap": cap_file})
         self.addTopLevelItem(item)
         return item
 
+    def to_record(self, item) -> dict:
+        return {
+            "bssid": item.text(self.COL_BSSID),
+            "essid": item.text(self.COL_ESSID),
+            "password": item.text(self.COL_PWD),
+            "cap": item.text(self.COL_CAP),
+            "status": item.text(self.COL_STATE),
+            "elapsed": item.text(self.COL_TIME),
+            "note": item.text(self.COL_NOTE),
+        }
+
+    def load_record(self, rec: dict):
+        item = QTreeWidgetItem([
+            rec.get("bssid", ""), rec.get("essid", ""),
+            rec.get("password", "") or "破解中...",
+            rec.get("cap", ""), rec.get("status", ""),
+            rec.get("elapsed", ""), rec.get("note", ""),
+        ])
+        self.addTopLevelItem(item)
+        state = rec.get("status", "")
+        if state == "成功":
+            self._paint_success(item)
+        elif state and state not in ("进行中",):
+            item.setText(self.COL_STATE, state)
+            item.setForeground(self.COL_STATE, QColor("#c62828"))
+        return item
+
+    def _paint_success(self, item):
+        item.setForeground(self.COL_STATE, QColor("#2e7d32"))
+        item.setForeground(self.COL_PWD, QColor("#1565c0"))
+
     def update_progress(self, item, password, elapsed):
         if password:
-            item.setText(2, password)
-            item.setText(4, "成功")
-            item.setForeground(4, QColor("#2e7d32"))
-            item.setForeground(2, QColor("#1565c0"))
-        else:
-            item.setText(5, elapsed)
-        self.scrollToItem(item)
+            item.setText(self.COL_PWD, password)
+            item.setText(self.COL_STATE, "成功")
+            item.setForeground(self.COL_STATE, QColor("#2e7d32"))
+            item.setForeground(self.COL_PWD, QColor("#1565c0"))
+            self.scrollToItem(item)
+        item.setText(self.COL_TIME, elapsed)
 
     def set_failed(self, item, reason="失败"):
-        item.setText(4, reason)
-        item.setForeground(4, QColor("#c62828"))
+        item.setText(self.COL_STATE, reason)
+        item.setForeground(self.COL_STATE, QColor("#c62828"))
+
+    def set_note(self, item, note):
+        item.setText(self.COL_NOTE, note)
+
+    def current_record(self):
+        items = self.selectedItems()
+        return items[0] if items else None
+
+
+class CrackSettingsDialog(QDialog):
+    ENGINES = ["Hashcat (GPU/CPU)", "Aircrack-ng (CPU)"]
+    DEVICES = ["GPU + CPU (自动)", "仅 GPU", "仅 CPU"]
+
+    def __init__(self, parent=None, config=None):
+        super().__init__(parent)
+        self.setWindowTitle("破解设置")
+        self.setMinimumWidth(430)
+        config = config or {}
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItems(self.ENGINES)
+        self.device_combo = QComboBox()
+        self.device_combo.addItems(self.DEVICES)
+        self.engine_combo.currentTextChanged.connect(self._sync_device)
+        form.addRow("破解引擎:", self.engine_combo)
+        form.addRow("计算设备:", self.device_combo)
+
+        self.extra_args = QLineEdit(config.get("hashcat_extra_args", ""))
+        self.extra_args.setPlaceholderText("--force --opencl-device-types 1,2")
+        form.addRow("Hashcat 额外参数:", self.extra_args)
+
+        self.auto_mon = QCheckBox("自动监听模式 (推荐)")
+        self.auto_mon.setChecked(config.get("auto_monitor", True))
+        form.addRow(self.auto_mon)
+
+        layout.addLayout(form)
+
+        hint = QLabel("提示: Aircrack-ng 仅支持 CPU，切换引擎时设备会自动锁定。")
+        hint.setStyleSheet("color: #888;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.engine_combo.setCurrentText(config.get("crack_engine", self.ENGINES[0]))
+        self.device_combo.setCurrentText(config.get("crack_device", self.DEVICES[0]))
+        self._sync_device(self.engine_combo.currentText())
+
+    def _sync_device(self, engine: str):
+        is_aircrack = engine.startswith("Aircrack")
+        self.device_combo.setEnabled(not is_aircrack)
+        if is_aircrack:
+            self.device_combo.setCurrentText(self.DEVICES[2])
+
+    def values(self) -> dict:
+        return {
+            "crack_engine": self.engine_combo.currentText(),
+            "crack_device": self.device_combo.currentText(),
+            "hashcat_extra_args": self.extra_args.text().strip(),
+            "auto_monitor": self.auto_mon.isChecked(),
+        }
 
 
 class MainUI(QWidget):
@@ -271,8 +371,12 @@ class MainUI(QWidget):
 
         self.ap_table = QTableWidget()
         self.ap_table.setColumnCount(7)
-        self.ap_table.setHorizontalHeaderLabels(["信号", "SSID", "BSSID", "信道", "加密", "厂商", "客户端"])
-        self.ap_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ap_table.setHorizontalHeaderLabels(["信号", "SSID", "BSSID", "信道", "加密", "认证", "信号强度"])
+        ap_header = self.ap_table.horizontalHeader()
+        ap_header.setSectionResizeMode(QHeaderView.Interactive)
+        ap_header.setStretchLastSection(False)
+        for idx, w in enumerate((50, 160, 170, 55, 110, 80, 90)):
+            self.ap_table.setColumnWidth(idx, w)
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.ap_table.setAlternatingRowColors(True)
@@ -320,6 +424,20 @@ class MainUI(QWidget):
         target_layout.addRow("握手包:", self.lbl_handshake)
         left_layout.addWidget(target_group)
 
+        cap_group = QGroupBox("握手包库 (按日期归类, 双击载入)")
+        cap_layout = QVBoxLayout(cap_group)
+        self.cap_tree = QTreeWidget()
+        self.cap_tree.setHeaderLabels(["日期 / 握手包", "大小"])
+        cap_header = self.cap_tree.header()
+        cap_header.setSectionResizeMode(QHeaderView.Interactive)
+        cap_header.setStretchLastSection(False)
+        self.cap_tree.setColumnWidth(0, 240)
+        self.cap_tree.setColumnWidth(1, 80)
+        self.cap_tree.setFixedHeight(120)
+        self.cap_tree.setAlternatingRowColors(True)
+        cap_layout.addWidget(self.cap_tree)
+        left_layout.addWidget(cap_group)
+
         main_splitter.addWidget(left_widget)
 
         # ---- 右侧: 破解面板 (EWSA 风格) ----
@@ -328,34 +446,36 @@ class MainUI(QWidget):
         right_layout.setSpacing(6)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        engine_group = QGroupBox("破解引擎")
+        engine_group = QGroupBox("当前引擎")
         engine_layout = QHBoxLayout(engine_group)
-        engine_layout.addWidget(QLabel("引擎:"))
-        self.crack_engine = QComboBox()
-        self.crack_engine.addItems(["Hashcat (GPU/CPU)", "Aircrack-ng (CPU)"])
-        engine_layout.addWidget(self.crack_engine)
-        engine_layout.addWidget(QLabel("设备:"))
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(["GPU + CPU (自动)", "仅 GPU", "仅 CPU"])
-        engine_layout.addWidget(self.device_combo)
+        self.lbl_engine = QLabel("Hashcat (GPU/CPU)  |  GPU + CPU (自动)")
+        self.lbl_engine.setStyleSheet("color: #1565c0; font-weight: bold;")
+        engine_layout.addWidget(self.lbl_engine)
         engine_layout.addStretch()
+        self.btn_change_engine = QPushButton("更改")
+        engine_layout.addWidget(self.btn_change_engine)
         right_layout.addWidget(engine_group)
 
         progress_group = QGroupBox("破解进度")
         progress_layout = QVBoxLayout(progress_group)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         progress_layout.addWidget(self.progress_bar)
+        self.scan_elapsed = QLabel("")
+        self.scan_elapsed.setStyleSheet("color: #888;")
+        progress_layout.addWidget(self.scan_elapsed)
         self.lbl_progress = QLabel("等待开始...")
         self.lbl_progress.setStyleSheet("color: #666;")
         progress_layout.addWidget(self.lbl_progress)
         right_layout.addWidget(progress_group)
 
-        result_group = QGroupBox("破解结果")
+        result_group = QGroupBox("破解结果 (按日期归类)")
         result_layout = QVBoxLayout(result_group)
-        self.crack_result = CrackResultWidget()
-        result_layout.addWidget(self.crack_result)
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setDocumentMode(True)
+        result_layout.addWidget(self.result_tabs)
 
         result_btn_layout = QHBoxLayout()
         self.btn_start_crack = QPushButton("▶ 开始破解")
@@ -365,29 +485,46 @@ class MainUI(QWidget):
         self.btn_stop_crack.setMinimumHeight(40)
         self.btn_stop_crack.setStyleSheet("font-weight: bold; background: #c62828; color: white; font-size: 14px;")
         self.btn_stop_crack.setEnabled(False)
+        self.btn_note = QPushButton("📝 备注")
+        self.btn_note.setToolTip("为选中记录添加备注，如破解地点")
+        self.btn_del_record = QPushButton("🗑 删除")
         self.btn_export = QPushButton("📤 导出结果")
         result_btn_layout.addWidget(self.btn_start_crack)
         result_btn_layout.addWidget(self.btn_stop_crack)
+        result_btn_layout.addWidget(self.btn_note)
+        result_btn_layout.addWidget(self.btn_del_record)
         result_btn_layout.addWidget(self.btn_export)
         result_layout.addLayout(result_btn_layout)
 
-        right_layout.addWidget(result_group)
+        right_layout.addWidget(result_group, 1)
 
         main_splitter.addWidget(right_widget)
-        main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setStretchFactor(0, 3)
+        main_splitter.setStretchFactor(1, 4)
 
         root.addWidget(main_splitter, 1)
 
-        # ===== 底部日志 =====
+        # ===== 底部日志: 抓包 / 破解 双Tab =====
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_group)
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(150)
-        self.log_box.setFont(QFont("Monospace", 9))
-        log_layout.addWidget(self.log_box)
+        self.log_tabs = QTabWidget()
+        self.log_tabs.setDocumentMode(True)
+        self.log_tabs.setMaximumHeight(190)
+
+        self.log_scan_box = self._make_log_box()
+        self.log_crack_box = self._make_log_box()
+        self.log_tabs.addTab(self.log_scan_box, "📡 抓包日志")
+        self.log_tabs.addTab(self.log_crack_box, "🔓 破解日志")
+        log_layout.addWidget(self.log_tabs)
         root.addWidget(log_group)
+
+    def _make_log_box(self):
+        box = QPlainTextEdit()
+        box.setReadOnly(True)
+        box.setMaximumBlockCount(800)
+        box.setFont(QFont("Monospace", 9))
+        box.setLineWrapMode(QPlainTextEdit.NoWrap)
+        return box
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
