@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import datetime
 import io
 import threading
 import re
@@ -167,6 +168,10 @@ class EasyAirApp(MainUI):
 
         # 破解控制
         self.btn_start_crack.clicked.connect(self._toggle_crack)
+        self.btn_batch_add.clicked.connect(self._batch_add_to_crack)
+        self.btn_copy_wifi.clicked.connect(self._copy_wifi_credentials)
+        self.cap_tree.customContextMenuRequested.connect(self._cap_menu)
+        self.cap_tree.itemChanged.connect(self._on_cap_note_edited)
         self.btn_export.clicked.connect(self._export_results)
         self.btn_note.clicked.connect(self._edit_note)
         self.btn_del_record.clicked.connect(self._delete_record)
@@ -443,11 +448,129 @@ class EasyAirApp(MainUI):
     def _current_result_tree(self):
         return self.result_tabs.currentWidget()
 
+    def _cap_menu(self, pos):
+        """握手包库右键菜单: 删除 / 清空。"""
+        item = self.cap_tree.itemAt(pos)
+        menu = QMenu(self)
+        act_del = menu.addAction("🗑 删除选中")
+        act_clear = menu.addAction("🧹 清空全部")
+        act_note = menu.addAction("📝 编辑备注")
+        chosen = menu.exec_(self.cap_tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_note:
+            if item:
+                self.cap_tree.editItem(item, 0)
+            return
+        if chosen == act_del:
+            self._delete_selected_caps()
+            return
+        if chosen == act_clear:
+            self._clear_all_caps()
+
+    def _selected_caps(self) -> list:
+        out = []
+        for it in self.cap_tree.selectedItems():
+            v = it.data(0, Qt.UserRole)
+            if v:
+                out.append(Path(v))
+        return out
+
+    def _delete_selected_caps(self):
+        caps = self._selected_caps()
+        if not caps:
+            self.set_status("请先在握手包库中选择要删除的文件")
+            return
+        if QMessageBox.question(
+                self, "删除确认",
+                f"确定删除选中的 {len(caps)} 个握手包?\\n删除后无法恢复。",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        n = 0
+        for c in caps:
+            try:
+                c.unlink(missing_ok=True)
+                Path(str(c) + ".note").unlink(missing_ok=True)
+                n += 1
+            except OSError as e:
+                self.log(f"[删除失败] {c.name}: {e}")
+        self._refresh_cap_tree()
+        self.set_status(f"已删除 {n} 个握手包")
+
+    def _clear_all_caps(self):
+        caps = [p for _, p, _ in self.core.list_handshakes()]
+        if not caps:
+            self.set_status("握手包库已是空的")
+            return
+        if QMessageBox.question(
+                self, "清空确认",
+                f"确定清空全部 {len(caps)} 个握手包?\\n删除后无法恢复。",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        n = 0
+        for c in caps:
+            try:
+                c.unlink(missing_ok=True)
+                Path(str(c) + ".note").unlink(missing_ok=True)
+                n += 1
+            except OSError as e:
+                self.log(f"[删除失败] {c.name}: {e}")
+        for sub in self.core.caps_dir.glob("20??-??-??"):
+            try:
+                sub.rmdir()      # 只删空目录
+            except OSError:
+                pass
+        self._refresh_cap_tree()
+        self.set_status(f"已清空 {n} 个握手包")
+
+    def _batch_add_to_crack(self):
+        """把握手包库中选中的多个握手包批量加入右侧列表。"""
+        caps = self._selected_caps()
+        if not caps:
+            QMessageBox.information(
+                self, "提示",
+                "请先在下方「握手包库」中按住 Ctrl 或 Shift 多选要破解的握手包")
+            return
+        tree = self._current_result_tree()
+        added = 0
+        for cap in caps:
+            note = self.core.cap_note(cap)
+            tree.add_target(cap.stem, "", str(cap), note)
+            added += 1
+        idx = self.result_tabs.currentIndex()
+        if idx >= 0:
+            self.result_tabs.setTabText(
+                idx, f"{self._tab_date(idx)} ({tree.topLevelItemCount()})")
+        self._persist_record()
+        self.set_status(f"已批量加入 {added} 个握手包到右侧列表")
+        self.log(f"[批量] 已加入 {added} 个握手包")
+
+    def _copy_wifi_credentials(self):
+        """复制选中记录的 WiFi 名称与密码, 无密码时不可用。"""
+        tree = self._current_result_tree()
+        item = tree.current_record() if tree else None
+        if not item:
+            return
+        pwd = item.text(CrackResultWidget.COL_PWD)
+        essid = item.text(CrackResultWidget.COL_ESSID) or ""
+        if not pwd or pwd == "破解中...":
+            self.set_status("该记录尚未破解出密码")
+            return
+        text = f"WIFI:S:{essid};T:WPA;P:{pwd};;"
+        QApplication.clipboard().setText(text)
+        self.set_status(f"已复制: {essid}")
+        self.log(f"[复制] {text}")
+
     def _sync_record_buttons(self, _date=None):
         tree = self._current_result_tree()
-        has = bool(tree and tree.current_record())
+        item = tree.current_record() if tree else None
+        has = bool(item)
         self.btn_note.setEnabled(has)
         self.btn_del_record.setEnabled(has)
+        # 只有真的破解出密码才允许复制, 否则置灰
+        pwd = item.text(CrackResultWidget.COL_PWD) if has else ""
+        self.btn_copy_wifi.setEnabled(
+            bool(pwd) and pwd != "破解中..." and pwd != "未找到")
 
     def _reload_current_tab(self):
         date = self._tab_date()
@@ -519,13 +642,39 @@ class EasyAirApp(MainUI):
             font.setBold(True)
             top.setFont(0, font)
             top.setForeground(0, QColor("#1565c0"))
+            top.setData(0, Qt.UserRole, day)   # 日期分组标记
+            # 每个子项: 文件名 + 导入日期时间 + 可编辑备注
             for path, size in sorted(caps, key=lambda x: x[0].name, reverse=True):
+                mtime = datetime.datetime.fromtimestamp(path.stat().st_mtime)
                 child = QTreeWidgetItem([
-                    path.name, f"{size / 1024:.1f} KB"])
+                    f"{path.name}    {mtime:%Y-%m-%d %H:%M:%S}",
+                    f"{size / 1024:.1f} KB"])
                 child.setData(0, Qt.UserRole, str(path))
+                child.setData(1, Qt.UserRole, self.core.cap_note(path))
+                self._apply_cap_note(child, self.core.cap_note(path))
+                child.setToolTip(0, str(path))
                 top.addChild(child)
             self.cap_tree.addTopLevelItem(top)
         self.cap_tree.expandAll()
+
+    def _apply_cap_note(self, item, note: str):
+        """把备注显示在导入时间后面, 并允许直接编辑。"""
+        base = item.text(0)
+        if "  ·  " in base:
+            base = base.split("  ·  ")[0]
+        item.setText(0, f"{base}  ·  {note}" if note else base)
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+
+    def _on_cap_note_edited(self, item, column):
+        if column != 0:
+            return
+        path = item.data(0, Qt.UserRole)
+        if not path:
+            return
+        text = item.text(0)
+        note = text.split("  ·  ")[1].strip() if "  ·  " in text else ""
+        self.core.set_cap_note(Path(path), note)
+        self._apply_cap_note(item, note)
 
     def _on_cap_selected(self):
         self._sync_record_buttons()
@@ -778,14 +927,19 @@ class EasyAirApp(MainUI):
                 self.ap_table.setUpdatesEnabled(False)
                 self.ap_table.setRowCount(len(rows))
                 for i, r in enumerate(rows):
-                    pwr_int, cli_count = r[0], r[8]
-                    for c, v in enumerate(r[1:], start=1):
-                        it = QTableWidgetItem(v)
-                        if c in (2, 7):
-                            it.setToolTip(str(v))
-                        if c == 7 and cli_count:
-                            it.setForeground(QColor("#1565c0"))
-                        self.ap_table.setItem(i, c, it)
+                    # r = (信号数值, SSID, 客户端, BSSID, 信道, 加密, 强度, 客户端数)
+                    pwr_int = r[0]
+                    cli_count = r[7]
+                    for col, val in ((1, r[1]), (2, r[2]), (3, r[3]),
+                                     (4, r[4]), (5, r[5]), (6, r[6])):
+                        it = QTableWidgetItem(val)
+                        if col in (1, 3):
+                            it.setToolTip(val)
+                        if col == 2:
+                            it.setForeground(QColor("#1565c0") if cli_count
+                                            else QColor("#b0bec5"))
+                            it.setToolTip(self._client_tips.get(r[3], val))
+                        self.ap_table.setItem(i, col, it)
                     bar, color = self._signal_bar(pwr_int)
                     it = QTableWidgetItem(bar)
                     it.setTextAlignment(Qt.AlignCenter)
@@ -855,6 +1009,7 @@ class EasyAirApp(MainUI):
         idx = {}
         rows = []
         hidden_count = 0
+        self._client_tips = {}
         # airodump 的分隔符是 ", "，引号前多一个空格会使 CSV 规范失效，
         # 含逗号的 SSID(如 "Cafe, Guest") 会被切成两列。先归一化再解析。
         txt = re.sub(r",\s+(?=\")", ",", txt)
@@ -919,14 +1074,23 @@ class EasyAirApp(MainUI):
             clients = stations_by_bssid.get(bssid.upper(), []) if stations_by_bssid else []
             client_count = len(clients)
             client_str = f"{client_count} 客户端"
-            if clients:
-                macs = ", ".join(c["mac"] for c in clients[:2])
-                if client_count > 2:
+            if client_count:
+                # 列窄, 只显示数量; MAC 明细放 tooltip
+                macs = ", ".join(c["mac"] for c in clients[:4])
+                if client_count > 4:
                     macs += f" 等{client_count}个"
-                client_str = f"{client_count} 客户端: {macs}"
+                client_str = f"{client_count} 台"
+                client_tip = macs
+            else:
+                client_str = "-"
+                client_tip = "无在线客户端"
 
-            rows.append((pwr_int, essid, bssid.upper(), ch, enc_col, auth,
-                         f"{pwr} dBm" if pwr else "", client_str, client_count))
+            # 元组顺序 = 表格列序: 信号(数值), SSID, 客户端, BSSID, 信道,
+            # 加密, 认证, 强度, 客户端数
+            rows.append((pwr_int, essid, client_str, bssid.upper(), ch,
+                         enc_col, f"{pwr} dBm" if pwr else "",
+                         client_count))
+            self._client_tips[bssid.upper()] = client_tip
         # 信号强的排前面(未知信号沉底)
         rows.sort(key=lambda r: (r[0] is None, -(r[0] if r[0] is not None else 0)))
         self._hidden_ssids = hidden_count
@@ -953,10 +1117,14 @@ class EasyAirApp(MainUI):
     def _select_target(self, row):
         if row < 0:
             return
-        essid = self.ap_table.item(row, 1).text()
-        bssid = self.ap_table.item(row, 2).text()
-        ch = self.ap_table.item(row, 3).text()
-        enc = self.ap_table.item(row, 4).text()
+        def _get(col):
+            it = self.ap_table.item(row, col)
+            return it.text() if it else ""
+        # 列序: 0信号 1SSID 2客户端 3BSSID 4信道 5加密 6强度
+        essid = _get(1)
+        bssid = _get(3)
+        ch = _get(4)
+        enc = _get(5)
         
         self.lbl_target_essid.setText(essid)
         self.lbl_target_bssid.setText(bssid)
@@ -1144,6 +1312,7 @@ class EasyAirApp(MainUI):
         self._run_worker(
             lambda: self.core.crack_hashcat(str(hc), wordlists, use_gpu, extra, tl),
             self._on_crack_proc)
+        self._sync_record_buttons()
         self.log_crack("[破解中] Hashcat 正在跑字典...")
 
     def _on_crack_output(self, line):
@@ -1180,9 +1349,18 @@ class EasyAirApp(MainUI):
         tree = getattr(self, 'current_crack_tree', None)
         if not tree or not self.current_crack_item:
             return
+        # tree 可能已被重建(如批量添加/清空后切换 tab), 此时旧 item 失效,
+        # 直接对 C++ 对象取 indexOfTopLevelItem 会抛 RuntimeError
+        try:
+            index = tree.indexOfTopLevelItem(self.current_crack_item)
+        except RuntimeError:
+            self.current_crack_item = None
+            return
+        if index < 0:
+            return
         self._last_persist = time.time()
-        index = tree.indexOfTopLevelItem(self.current_crack_item)
-        self.core.history_update(self.current_crack_date, index, tree.to_record(self.current_crack_item))
+        self.core.history_update(self.current_crack_date, index,
+                                 tree.to_record(self.current_crack_item))
 
     def _update_crack_timer(self):
         elapsed = self._format_elapsed(self.crack_start_time)
@@ -1202,6 +1380,7 @@ class EasyAirApp(MainUI):
     def _on_crack_finished(self):
         self.crack_timer.stop()
         self.progress_bar.setVisible(False)
+        self._sync_record_buttons()
         self.btn_start_crack.setEnabled(True)
         self.btn_start_crack.setText("▶ 开始破解")
         self.btn_start_crack.setStyleSheet(
@@ -1229,6 +1408,7 @@ class EasyAirApp(MainUI):
             self.conv_thread = None
         self.crack_timer.stop()
         self.progress_bar.setVisible(False)
+        self._sync_record_buttons()
         self.btn_start_crack.setEnabled(True)
         self.btn_start_crack.setText("▶ 开始破解")
         self.btn_start_crack.setStyleSheet(

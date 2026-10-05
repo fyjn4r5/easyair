@@ -155,12 +155,18 @@ class AirCore:
     def list_handshakes(self) -> List[Tuple[str, Path, int]]:
         """按日期倒序返回 (日期, 路径, 大小)"""
         out = []
-        for cap in self.caps_dir.glob("handshake*.cap"):
+        caps = list(self.caps_dir.glob("handshake*.cap"))
+        for sub in sorted(self.caps_dir.glob("20??-??-??")):
+            if sub.is_dir():
+                caps.extend(sub.glob("handshake*.cap"))
+        for cap in caps:
             try:
                 st = cap.stat()
             except OSError:
                 continue
-            day = datetime.date.fromtimestamp(st.st_mtime).isoformat()
+            # 目录名即日期(抓包当天), 比文件 mtime 更可靠
+            day = (cap.parent.name if cap.parent != self.caps_dir
+                   else datetime.date.fromtimestamp(st.st_mtime).isoformat())
             out.append((day, cap, st.st_size, st.st_mtime))
         out.sort(key=lambda x: (x[0], x[3]), reverse=True)
         return [(d, p, s) for d, p, s, _ in out]
@@ -405,8 +411,36 @@ class AirCore:
         cmd = f"airodump-ng {mon_iface} --write-interval 1 --output-format csv -w {outpath}"
         return self.run_cmd(cmd, sudo=True)
 
+    def cap_note(self, cap: Path) -> str:
+        """读取握手包备注(存在同名 .note 旁文件, 不污染 .cap)。"""
+        try:
+            return Path(str(cap) + ".note").read_text(
+                encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            return ""
+
+    def set_cap_note(self, cap: Path, note: str):
+        p = Path(str(cap) + ".note")
+        try:
+            if note:
+                p.write_text(note, encoding="utf-8")
+            elif p.exists():
+                p.unlink()
+        except OSError as e:
+            print(f"[备注保存失败] {e}")
+
+    def _dated_dir(self) -> Path:
+        """当日握手包目录: captures/YYYY-MM-DD/
+        握手包是需要长期留存的证据, 按日期分目录便于整理与长期保存。"""
+        d = self.caps_dir / datetime.date.today().isoformat()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return self.caps_dir
+        return d
+
     def airodump_capture(self, mon_iface: str, bssid: str, ch: str, outfile_prefix: str = "handshake"):
-        outpath = self.caps_dir / outfile_prefix
+        outpath = self._dated_dir() / outfile_prefix
         cmd = f"airodump-ng --bssid {bssid} --channel {ch} --output-format pcap,csv -w {outpath} {mon_iface}"
         return self.run_cmd(cmd, sudo=True)
 
@@ -444,6 +478,11 @@ class AirCore:
 
     def get_latest_handshake(self) -> Optional[Path]:
         caps = list(self.caps_dir.glob("handshake-*.cap"))
+        for sub in sorted(self.caps_dir.glob("20??-??-??"), reverse=True):
+            if sub.is_dir():
+                caps.extend(sub.glob("handshake-*.cap"))
+        if not caps:
+            return None
         if not caps:
             return None
         return max(caps, key=lambda x: x.stat().st_mtime)

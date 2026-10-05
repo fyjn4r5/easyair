@@ -203,7 +203,12 @@ class CrackResultWidget(QTreeWidget):
 
     def current_record(self):
         items = self.selectedItems()
-        return items[0] if items else None
+        if items:
+            return items[0]
+        item = self.currentItem()
+        if item is not None and item.parent() is None:  # 只认顶层记录
+            return item
+        return None
 
 
 class CrackSettingsDialog(QDialog):
@@ -356,18 +361,6 @@ class MainUI(QWidget):
         self.lbl_mon_status.setStyleSheet("color: #9e9e9e; font-weight: bold; min-width: 120px;")
         tb_layout.addWidget(self.lbl_mon_status)
 
-        tb_layout.addSpacing(20)
-
-        self.lbl_scan_status = QLabel()
-        self.lbl_scan_status.setFixedSize(20, 20)
-        self.lbl_scan_status.setPixmap(create_status_icon("#9e9e9e", 20).pixmap(20, 20))
-        self.lbl_scan_status.setToolTip("扫描状态: 空闲")
-        tb_layout.addWidget(self.lbl_scan_status)
-
-        self.lbl_scan_text = QLabel("扫描: 空闲")
-        self.lbl_scan_text.setStyleSheet("color: #666; min-width: 100px;")
-        tb_layout.addWidget(self.lbl_scan_text)
-
         tb_layout.addStretch()
 
         self.btn_dict_mgr = QPushButton("📁 字典")
@@ -439,14 +432,14 @@ class MainUI(QWidget):
         ap_group_layout.setSpacing(6)
 
         self.ap_table = QTableWidget()
-        self.ap_table.setColumnCount(8)
+        self.ap_table.setColumnCount(7)
         self.ap_table.setHorizontalHeaderLabels(
-            ["信号", "SSID", "BSSID", "信道", "加密", "认证", "强度", "客户端"])
+            ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"])
         ap_header = self.ap_table.horizontalHeader()
         ap_header.setSectionResizeMode(QHeaderView.Interactive)
         ap_header.setStretchLastSection(False)
         ap_header.setHighlightSections(False)
-        for idx, w in enumerate((46, 140, 160, 46, 96, 74, 56, 190)):
+        for idx, w in enumerate((44, 132, 92, 150, 44, 88, 52)):
             self.ap_table.setColumnWidth(idx, w)
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -462,6 +455,9 @@ class MainUI(QWidget):
         self.ap_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.ap_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.ap_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # "认证"列信息价值低(与加密重复), 并入加密列显示, 省出宽度给客户端
+        self.ap_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.Interactive)
         self.ap_table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.ap_table.setSelectionMode(QAbstractItemView.SingleSelection)
         ap_group_layout.addWidget(self.ap_table, 1)
@@ -504,12 +500,19 @@ class MainUI(QWidget):
         self.btn_start_crack.setStyleSheet(
             "font-weight: bold; background: #2e7d32; color: white;")
         self.btn_start_crack.setToolTip("点击开始破解；破解中点击可随时停止")
+        self.btn_copy_wifi = QPushButton("📋 复制WiFi")
+        self.btn_copy_wifi.setToolTip(
+            "把选中记录的 WiFi 名称和密码复制为可直接粘贴的格式")
+        self.btn_copy_wifi.setEnabled(False)   # 无破解结果时置灰
         self.btn_note = QPushButton("📝 备注")
         self.btn_note.setToolTip("为选中记录添加备注，如破解地点")
         self.btn_del_record = QPushButton("🗑 删除")
         self.btn_export = QPushButton("📤 导出")
-        for b in (self.btn_start_crack, self.btn_note,
-                  self.btn_del_record, self.btn_export):
+        self.btn_batch_add = QPushButton("📥 批量加入")
+        self.btn_batch_add.setToolTip(
+            "把握手包库中选中的多个握手包一次性加入右侧列表批量破解")
+        for b in (self.btn_start_crack, self.btn_batch_add, self.btn_copy_wifi,
+                  self.btn_note, self.btn_del_record, self.btn_export):
             b.setMinimumHeight(32)
             result_btn_layout.addWidget(b)
         result_layout.addLayout(result_btn_layout)
@@ -577,6 +580,8 @@ class MainUI(QWidget):
         cap_header = self.cap_tree.header()
         cap_header.setSectionResizeMode(QHeaderView.Interactive)
         cap_header.setStretchLastSection(False)
+        self.cap_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.cap_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.cap_tree.setColumnWidth(0, 460)
         self.cap_tree.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         _cap_vh = self.cap_tree.header()
@@ -739,22 +744,17 @@ class MainUI(QWidget):
             self.btn_scan.setText("🔍 扫描")
             self.btn_scan.setStyleSheet(
                 "font-weight: bold; background: #1976d2; color: white;")
-            self.lbl_scan_status.setPixmap(create_status_icon("#9e9e9e", 20).pixmap(20, 20))
-            self.lbl_scan_text.setText("扫描: 空闲")
-            self.lbl_scan_text.setStyleSheet("color: #666; min-width: 100px;")
+
         elif status == "scanning":
             self.btn_scan.setEnabled(True)
             self.btn_scan.setText("⏹ 停止扫描")
             self.btn_scan.setStyleSheet(
                 "font-weight: bold; background: #c62828; color: white;")
-            self.lbl_scan_status.setPixmap(create_status_icon("#1976d2", 20).pixmap(20, 20))
-            self.lbl_scan_text.setText("扫描: 进行中...")
-            self.lbl_scan_text.setStyleSheet("color: #1976d2; font-weight: bold; min-width: 100px;")
+            self.btn_scan.setToolTip("扫描进行中，点击可随时停止（不关闭监听模式）")
         elif status == "stopping":
             self.btn_scan.setEnabled(False)
             self.btn_scan.setText("⏹ 停止中...")
-            self.lbl_scan_text.setText("扫描: 停止中...")
-            self.lbl_scan_text.setStyleSheet("color: #f57c00; min-width: 100px;")
+            self.btn_scan.setToolTip("正在停止…")
 
     def closeEvent(self, event):
         if hasattr(self, 'tray_icon'):

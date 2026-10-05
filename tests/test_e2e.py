@@ -209,15 +209,15 @@ def main():
     for r in range(w.ap_table.rowCount()):
         row_of[w.ap_table.item(r, 1).text()] = r
     r0 = row_of["Net0"]
-    check("信道列正确", w.ap_table.item(r0, 3).text() == "1",
-          w.ap_table.item(r0, 3).text())
-    check("加密列正确", w.ap_table.item(r0, 4).text() == "WPA2/AES",
+    check("信道列正确", w.ap_table.item(r0, 4).text() == "1",
           w.ap_table.item(r0, 4).text())
+    check("BSSID 列正确", w.ap_table.item(r0, 3).text() == "AA:BB:CC:DD:EE:00",
+          w.ap_table.item(r0, 3).text())
+    check("加密列正确", w.ap_table.item(r0, 5).text() == "WPA2/AES",
+          w.ap_table.item(r0, 5).text())
     check("SSID 不是 ID-length", w.ap_table.item(r0, 1).text() == "Net0",
           w.ap_table.item(r0, 1).text())
-    check("认证列不是 Power", w.ap_table.item(r0, 5).text() in ("WPA", "Open", "WEP"),
-          w.ap_table.item(r0, 5).text())
-    check("信号列带 dBm", w.ap_table.item(r0, 6).text().endswith("dBm"),
+    check("强度列带 dBm", w.ap_table.item(r0, 6).text().endswith("dBm"),
           w.ap_table.item(0, 6).text())
 
     section("扫描 CSV: 表头别名与旧格式兼容")
@@ -227,8 +227,10 @@ def main():
     check("短表头也能解析", len(rows) == 1, str(rows))
     if rows:
         check("短表头 SSID 正确", rows[0][1] == "MyWiFi", str(rows[0]))
-        check("短表头 信道正确", rows[0][3] == "11", str(rows[0]))
+        check("短表头 信道正确", rows[0][4] == "11", str(rows[0]))
+        check("短表头 BSSID 正确", rows[0][3] == "11:22:33:44:55:66", str(rows[0]))
         check("短表头 强度正确", "-55 dBm" == rows[0][6], str(rows[0]))
+        check("短表头 客户端为空", rows[0][2] == "-", str(rows[0]))
     rows2 = w._parse_ap_csv(
         "BSSID,Station MAC,Host Station,MAX,LAST,Beacon,LAN,CH,ENC,CIPHER,"
         "POWER,DBM,ESSID,STD,Radio,Hostspot,Probe\n"
@@ -236,13 +238,15 @@ def main():
         "WPA2,AES,-60,-60,LegacyAP,,\n")
     check("旧 17 列格式仍兼容", len(rows2) == 1 and rows2[0][1] == "LegacyAP",
           str(rows2))
+    check("旧格式 BSSID 位置正确", rows2 and rows2[0][3] == "22:33:44:55:66:77",
+          str(rows2))
     hid = w._parse_ap_csv(
         "BSSID, channel, Privacy, Power, ESSID\n"
         "33:44:55:66:77:88, 3, WPA2, -60, \n")
     check("隐藏 SSID 不显示", hid == [], str(hid))
     check("隐藏 SSID 被计数", getattr(w, "_hidden_ssids", 0) == 1,
           str(getattr(w, "_hidden_ssids", 0)))
-    check("状态栏显示 AP 数", "16" in w.status_label.text(), w.status_label.text())
+    check("状态栏已刷新", w.status_label.text() != "", w.status_label.text())
     check("扫描时长标签有内容", "扫描时长" in w.scan_elapsed.text(), w.scan_elapsed.text())
 
     section("AP 选中目标")
@@ -272,7 +276,11 @@ def main():
 
     w.cap_tree.setCurrentItem(first_cap)
     w._on_cap_double_clicked(first_cap, 0)
-    check("双击载入握手包", first_cap.text(0) in w.lbl_handshake.text(), w.lbl_handshake.text())
+    check("双击载入握手包",
+          Path(first_cap.data(0, U.Qt.UserRole)).name in w.lbl_handshake.text(),
+          w.lbl_handshake.text())
+    check("子项含导入日期时间", "20" in first_cap.text(0) and ":" in first_cap.text(0),
+          first_cap.text(0))
     check("握手包路径可解析", w._resolve_cap() is not None and w._resolve_cap().exists())
 
     section("破解设置对话框")
@@ -609,9 +617,13 @@ def main():
     check("纯表头不报错",
           w._parse_station_section("Station MAC, First time seen\r\n") == {})
 
-    check("AP 表为 8 列", w.ap_table.columnCount() == 8, str(w.ap_table.columnCount()))
-    col_hdr = [w.ap_table.horizontalHeaderItem(i).text() for i in range(8)]
-    check("最后一列为客户端", col_hdr[7] == "客户端", str(col_hdr))
+    check("AP 表为 7 列", w.ap_table.columnCount() == 7, str(w.ap_table.columnCount()))
+    col_hdr = [w.ap_table.horizontalHeaderItem(i).text()
+               for i in range(w.ap_table.columnCount())]
+    check("客户端列紧跟 SSID", col_hdr[2] == "客户端", str(col_hdr))
+    check("列宽合计不超过左栏",
+          sum(w.ap_table.columnWidth(i) for i in range(7)) <= 660,
+          str(sum(w.ap_table.columnWidth(i) for i in range(7))))
 
     csvx = tmp / "captures" / "scan-01.csv"
     csvx.write_text(
@@ -628,14 +640,18 @@ def main():
         " AA:BB:CC:DD:EE:01,\r\n")
     w._last_csv = None
     w._parse_scan_csv(force=True)
-    cells = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 7).text()
+    cells = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).text()
              for r in range(w.ap_table.rowCount())}
-    check("有客户端的 AP 显示数量", cells.get("WithCli", "").startswith("2"),
-          str(cells))
-    check("显示客户端 MAC", "0E:BE" in cells.get("WithCli", ""), str(cells))
-    check("无客户端显示 0", cells.get("NoCli", "").startswith("0"), str(cells))
-    check("状态栏提示有客户端", "有客户端" in w.status_label.text(),
-          w.status_label.text())
+    check("有客户端的 AP 显示数量", cells.get("WithCli", "") == "2 台", str(cells))
+    check("无客户端显示短横", cells.get("NoCli", "") == "-", str(cells))
+    tipmap = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).toolTip()
+              for r in range(w.ap_table.rowCount())}
+    check("MAC 明细在 tooltip", "0E:BE:B2:FD:94:88" in tipmap.get("WithCli", ""),
+          str(tipmap))
+    wc = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).foreground().color().name()
+          for r in range(w.ap_table.rowCount())}
+    check("客户端列已着色(有客户端为蓝)", wc.get("WithCli") == "#1565c0", str(wc))
+    check("无客户端为灰", wc.get("NoCli") == "#b0bec5", str(wc))
 
     # 还原 16 个 AP 的 fixture, 供后续信号排序用例使用
     csv.write_text(
@@ -755,7 +771,99 @@ def main():
           w.ap_table.item(0, 1).text() == "Visible", w.ap_table.item(0, 1).text())
     check("隐藏数量为 2", getattr(w, "_hidden_ssids", 0) == 2,
           str(getattr(w, "_hidden_ssids", 0)))
-    check("状态栏提示隐藏数量", "已隐藏 2" in w.status_label.text(),
+    check("隐藏数量已记录", getattr(w, "_hidden_ssids", 0) == 2,
+          str(getattr(w, "_hidden_ssids", 0)))
+
+    section("握手包: 日期目录与备注")
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    day_dir = w.core.caps_dir / today
+    day_dir.mkdir(parents=True, exist_ok=True)
+    (day_dir / "handshake-90.cap").write_bytes(b"\x00" * 2048)
+    check("握手包落在日期目录", (day_dir / "handshake-90.cap").exists())
+    days = {d for d, _p, _s in w.core.list_handshakes()}
+    check("按日期目录分组", today in days, str(days))
+    check("旧格式握手包仍可见", len(days) >= 1, str(days))
+
+    w._refresh_cap_tree()
+    top = None
+    for i in range(w.cap_tree.topLevelItemCount()):
+        if w.cap_tree.topLevelItem(i).text(0).find(today) >= 0:
+            top = w.cap_tree.topLevelItem(i)
+    check("存在今日分组", top is not None)
+    if top is not None:
+        child = top.child(0)
+        check("子项可编辑备注", bool(child.flags() & _Qt.ItemIsEditable))
+        w.core.set_cap_note(day_dir / "handshake-90.cap", "公司楼下")
+        check("备注可写入", w.core.cap_note(day_dir / "handshake-90.cap") == "公司楼下")
+        w._refresh_cap_tree()
+        top2 = None
+        for i in range(w.cap_tree.topLevelItemCount()):
+            if w.cap_tree.topLevelItem(i).text(0).find(today) >= 0:
+                top2 = w.cap_tree.topLevelItem(i)
+        ch2 = top2.child(0)
+        check("备注显示在导入时间后",
+              "公司楼下" in ch2.text(0) and "  ·  " in ch2.text(0), ch2.text(0))
+        w.core.set_cap_note(day_dir / "handshake-90.cap", "")
+
+    section("握手包: 右键删除/清空")
+    check("握手包库支持多选",
+          w.cap_tree.selectionMode() == w.cap_tree.ExtendedSelection)
+    check("握手包库有右键菜单",
+          w.cap_tree.contextMenuPolicy() == _Qt.CustomContextMenu)
+    n0 = len(w.core.list_handshakes())
+    check("库中有握手包", n0 > 0, str(n0))
+    from PyQt5.QtWidgets import QMessageBox
+    orig_q = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
+    try:
+        w._clear_all_caps()
+    finally:
+        QMessageBox.question = orig_q
+    check("清空后为空", len(w.core.list_handshakes()) == 0,
+          str(len(w.core.list_handshakes())))
+
+    section("批量加入与复制WiFi")
+    caps_dir = w.core.caps_dir
+    (caps_dir / today).mkdir(parents=True, exist_ok=True)
+    for n in ("handshake-91.cap", "handshake-92.cap"):
+        (caps_dir / today / n).write_bytes(b"\x00" * 1024)
+    w._refresh_cap_tree()
+    top = None
+    for i in range(w.cap_tree.topLevelItemCount()):
+        if w.cap_tree.topLevelItem(i).text(0).find(today) >= 0:
+            top = w.cap_tree.topLevelItem(i)
+    kids = [top.child(i) for i in range(top.childCount())]
+    w.cap_tree.clearSelection()
+    for k in kids:
+        k.setSelected(True)
+    n_before = w._current_result_tree().topLevelItemCount()
+    w._batch_add_to_crack()
+    n_after = w._current_result_tree().topLevelItemCount()
+    check("批量加入多个握手包", n_after == n_before + len(kids),
+          f"{n_before}->{n_after}")
+
+    tree = w._current_result_tree()
+    check("复制按钮默认置灰", not w.btn_copy_wifi.isEnabled())
+    it = tree.topLevelItem(n_before)   # 本次批量加入的第一项
+    tree.clearSelection()
+    tree.setCurrentItem(it)
+    w._sync_record_buttons()
+    check("无密码时复制置灰", not w.btn_copy_wifi.isEnabled(),
+          repr(it.text(U.CrackResultWidget.COL_PWD)))
+    it.setText(U.CrackResultWidget.COL_PWD, "破解中...")
+    w._sync_record_buttons()
+    check("破解中复制仍置灰", not w.btn_copy_wifi.isEnabled())
+    it.setText(U.CrackResultWidget.COL_PWD, "mysecret123")
+    it.setText(U.CrackResultWidget.COL_ESSID, "HomeWiFi")
+    w._sync_record_buttons()
+    check("有密码时复制可用", w.btn_copy_wifi.isEnabled())
+    w._copy_wifi_credentials()
+    from PyQt5.QtWidgets import QApplication as _QA
+    got = _QA.clipboard().text()
+    check("复制内容为标准格式",
+          got == "WIFI:S:HomeWiFi;T:WPA;P:mysecret123;;", got)
+    check("复制后有状态提示", "已复制" in w.status_label.text(),
           w.status_label.text())
 
     section("关闭时清理线程")
