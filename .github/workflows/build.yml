@@ -49,8 +49,17 @@ jobs:
         run: |
           source .venv/bin/activate
           xvfb-run -a python3 -c "
+          import sys
+          sys.path.insert(0, '.')
           from PyQt5.QtWidgets import QApplication
-          import psutil, core.aircore, ui.main_ui
+          import psutil
+          import core.aircore
+          import ui.main_ui
+          app = QApplication([])
+          win = ui.main_ui.MainUI()
+          print('MainUI created OK')
+          print('Has btn_mon_toggle:', hasattr(win, 'btn_mon_toggle'))
+          print('Has btn_scan:', hasattr(win, 'btn_scan'))
           print('All modules OK')
           "
 
@@ -63,6 +72,7 @@ jobs:
             --add-data "core:core" \
             --add-data "ui:ui" \
             --add-data "config:config" \
+            --paths=. \
             --hidden-import=PyQt5 \
             --hidden-import=PyQt5.QtCore \
             --hidden-import=PyQt5.QtWidgets \
@@ -70,8 +80,10 @@ jobs:
             --hidden-import=PyQt5.QtPrintSupport \
             --hidden-import=PyQt5.sip \
             --hidden-import=psutil \
-            --collect-all=ui \
-            --collect-all=core \
+            --hidden-import=ui \
+            --hidden-import=ui.main_ui \
+            --hidden-import=core \
+            --hidden-import=core.aircore \
             main.py
 
       - name: Verify binary
