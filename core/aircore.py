@@ -106,7 +106,6 @@ class AirCore:
             return False
 
     def _run_sudo(self, args: List[str]) -> subprocess.CompletedProcess:
-        """同步执行 sudo 命令，用于清理等非交互操作"""
         pwd = self._get_sudo_password()
         if pwd and not self._password_verified:
             if self._verify_sudo_password(pwd):
@@ -139,7 +138,6 @@ class AirCore:
             )
 
     def _run_sudo_cmd(self, cmd: str) -> subprocess.Popen:
-        """异步执行 sudo 命令，用于长时间运行的进程"""
         pwd = self._get_sudo_password()
         
         if pwd and not self._password_verified:
@@ -195,7 +193,6 @@ class AirCore:
             return []
 
     def get_monitor_interface(self, iface: str) -> Optional[str]:
-        """获取对应的监听模式接口名"""
         try:
             res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace')
             for line in res.stdout.splitlines():
@@ -209,24 +206,28 @@ class AirCore:
         return None
 
     def check_monitor_mode(self, iface: str) -> bool:
-        """检查接口是否已在监听模式"""
         try:
             res = subprocess.run(["iwconfig", iface], capture_output=True, text=True, encoding='utf-8', errors='replace')
-            return "Mode:Monitor" in res.stdout
+            if "Mode:Monitor" in res.stdout:
+                return True
         except Exception:
-            return False
+            pass
+        try:
+            res = subprocess.run(["iw", "dev", iface, "info"], capture_output=True, text=True, encoding='utf-8', errors='replace')
+            if "type monitor" in res.stdout:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _cleanup_monitor(self, iface: str):
-        """清理可能残留的监听接口 - 使用同步 sudo"""
         self.log(f"[清理] 检查残留监听接口: {iface}")
         
-        # 先尝试停止可能的 mon 接口
         mon = self.get_monitor_interface(iface)
         if mon and mon != iface:
             self.log(f"[清理] 停止残留 mon 接口: {mon}")
             self._run_sudo(["airmon-ng", "stop", mon])
         
-        # 再尝试停止物理接口（如果它变成了 monitor 模式）
         if self.check_monitor_mode(iface):
             self.log(f"[清理] 停止物理接口 monitor 模式: {iface}")
             self._run_sudo(["airmon-ng", "stop", iface])
@@ -234,46 +235,36 @@ class AirCore:
         time.sleep(0.5)
 
     def start_monitor(self, iface: str):
-        """开启监听模式"""
         self.log(f"[监听模式] 准备开启: {iface}")
         
-        # 1. 先清理残留（同步）
         self._cleanup_monitor(iface)
         
-        # 2. 再次检查是否已经在监听模式（清理后）
         if self.check_monitor_mode(iface):
             self.log(f"[监听模式] {iface} 清理后仍是 Monitor 模式，直接使用")
-            return subprocess.Popen(["echo", "already_monitor"], stdout=subprocess.PIPE, text=True)
+            return subprocess.Popen(["echo", "ALREADY_MONITOR"], stdout=subprocess.PIPE, text=True)
         
-        # 3. 杀掉干扰进程
         self.log(f"[监听模式] 杀掉干扰进程...")
         self._run_sudo(["airmon-ng", "check", "kill"])
         
-        # 4. 启动监听模式
         self.log(f"[监听模式] 执行: airmon-ng start {iface}")
         p = self._run_sudo_cmd(f"airmon-ng start {iface}")
         return p
 
     def stop_monitor(self, mon_iface: str):
-        """关闭监听模式"""
         self.log(f"[监听模式] 关闭: {mon_iface}")
         p = self._run_sudo_cmd(f"airmon-ng stop {mon_iface}")
         return p
 
     def ensure_monitor(self, iface: str) -> Tuple[bool, str]:
-        """确保接口在监听模式，返回(成功, 监听接口名)"""
         self._password_verified = False
         self.log(f"[监听模式] 确保 {iface} 进入监听模式...")
         
-        # 先清理
         self._cleanup_monitor(iface)
         
-        # 检查物理接口是否已是监听模式
         if self.check_monitor_mode(iface):
             self.log(f"[监听模式] {iface} 已经是 Monitor 模式，直接使用")
             return True, iface
         
-        # 启动
         p = self.start_monitor(iface)
         start_time = time.time()
         output_lines = []
@@ -287,18 +278,15 @@ class AirCore:
             time.sleep(0.1)
         p.wait()
         
-        # 关键：先检查原接口是否变成了 monitor 模式
         if self.check_monitor_mode(iface):
             self.log(f"[监听模式] 成功: {iface} (原接口直接切换)")
             return True, iface
         
-        # 再检查是否生成了新的 mon 接口
         mon = self.get_monitor_interface(iface)
         if mon and self.check_monitor_mode(mon):
             self.log(f"[监听模式] 成功开启新接口: {mon}")
             return True, mon
         
-        # 兜底：从输出中提取
         for line in output_lines:
             if "monitor mode enabled" in line.lower():
                 match = re.search(r'(\w+mon\d*)', line)
@@ -307,7 +295,6 @@ class AirCore:
                     if self.check_monitor_mode(mon):
                         self.log(f"[监听模式] 从输出解析到: {mon}")
                         return True, mon
-                # 输出里没 mon 但说 enabled，可能是原接口
                 if self.check_monitor_mode(iface):
                     return True, iface
         
