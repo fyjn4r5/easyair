@@ -73,6 +73,9 @@ class EasyAirApp(MainUI):
         # 网卡
         self.btn_refresh_iface.clicked.connect(self._refresh_ifaces)
 
+        # 监听模式按钮（手动切换）
+        self.btn_mon_toggle.toggled.connect(self._on_mon_toggle)
+
         # 扫描/抓包
         self.btn_scan.clicked.connect(self._start_scan)
         self.btn_stop_scan.clicked.connect(self._stop_scan)
@@ -82,7 +85,7 @@ class EasyAirApp(MainUI):
         # 字典管理
         self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
 
-        # 破解设置 (暂时用对话框)
+        # 破解设置
         self.btn_crack_cfg.clicked.connect(self._open_crack_settings)
 
         # 破解控制
@@ -110,10 +113,65 @@ class EasyAirApp(MainUI):
             self.log("  - 真机: 确认网卡驱动正常")
             self.log("  - 虚拟机: 需将支持监听的 USB 无线网卡直通")
 
+    # ===== 监听模式手动切换 =====
+    def _on_mon_toggle(self, checked: bool):
+        physical = self.iface_combo.currentText()
+        if not physical:
+            self.btn_mon_toggle.setChecked(False)
+            return
+
+        if checked:
+            self.log(f"[手动] 开启监听模式: {physical}")
+            self.set_monitor_status("starting")
+            p = self.core.start_monitor(physical)
+            self.mon_thread = CmdThread(p)
+            self.mon_thread.line_out.connect(self.log)
+            self.mon_thread.finished.connect(lambda: self._on_mon_started(physical))
+            self.mon_thread.start()
+            self.physical_iface = physical
+        else:
+            self._stop_monitor_manual()
+
+    def _on_mon_started(self, physical: str):
+        """监听模式启动完成，检测实际监听接口"""
+        # 核心修复：优先检查原物理接口是否已变 monitor 模式
+        if self.core.check_monitor_mode(physical):
+            self.mon_iface = physical
+            self.log(f"[就绪] 监听接口: {physical} (原接口直接切换)")
+            self.set_monitor_status("on")
+            return
+
+        # 兜底：查找名字含 mon 的新接口
+        for iface in self.core.list_interfaces():
+            if "mon" in iface and physical in iface:
+                if self.core.check_monitor_mode(iface):
+                    self.mon_iface = iface
+                    self.log(f"[就绪] 监听接口: {iface}")
+                    self.set_monitor_status("on")
+                    return
+
+        self.log("[错误] 监听模式开启失败：未检测到 monitor 接口")
+        self.set_monitor_status("error")
+        self.btn_mon_toggle.setChecked(False)
+
+    def _stop_monitor_manual(self):
+        if self.mon_iface:
+            self.log(f"[手动] 关闭监听模式: {self.mon_iface}")
+            p = self.core.stop_monitor(self.mon_iface)
+            t = CmdThread(p)
+            t.line_out.connect(self.log)
+            t.finished.connect(self._on_mon_stopped)
+            t.start()
+
+    def _on_mon_stopped(self):
+        self.mon_iface = None
+        self.physical_iface = None
+        self.set_monitor_status("off")
+        self.btn_mon_toggle.setChecked(False)
+
     # ===== 字典管理 =====
     def _load_wordlists(self):
-        for wl in self.core.get_wordlists():
-            pass  # 不在主界面显示，只在对话框管理
+        pass  # 不在主界面显示
 
     def _open_dict_manager(self):
         dlg = WordListDialog(self, self.core.get_wordlists())
@@ -124,8 +182,7 @@ class EasyAirApp(MainUI):
             self.log(f"[字典] 已更新，共 {len(new_lists)} 个字典文件")
 
     def _open_crack_settings(self):
-        # 简单对话框
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QLineEdit, QDialogButtonBox, QCheckBox, QComboBox
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QFormLayout, QLineEdit, QDialogButtonBox, QCheckBox
         dlg = QDialog(self)
         dlg.setWindowTitle("破解设置")
         dlg.resize(400, 250)
@@ -152,7 +209,7 @@ class EasyAirApp(MainUI):
             self.core.save_config()
             self.log("[设置] 已保存")
 
-    # ===== 扫描 AP =====
+    # ===== 扫描 AP（自动开启监听）=====
     def _start_scan(self):
         physical = self.iface_combo.currentText()
         if not physical:
@@ -161,8 +218,8 @@ class EasyAirApp(MainUI):
 
         self.set_status("正在开启监听模式并扫描...")
         self.log(f"[自动] 开启监听模式: {physical}")
+        self.set_monitor_status("starting")
         
-        # 后台线程处理监听模式开启 + 扫描
         self.physical_iface = physical
         self.mon_thread = CmdThread(self.core.start_monitor(physical))
         self.mon_thread.line_out.connect(self.log)
@@ -174,28 +231,31 @@ class EasyAirApp(MainUI):
 
     def _on_mon_ready_for_scan(self):
         """监听模式就绪，开始扫描"""
-        # 查找监听接口
-        for i in range(self.iface_combo.count()):
-            txt = self.iface_combo.itemText(i)
-            if "mon" in txt and self.physical_iface in txt:
-                self.mon_iface = txt
-                break
+        physical = self.physical_iface
         
-        if not self.mon_iface:
-            # 兜底：重新检测
-            for i in self.core.list_interfaces():
-                if "mon" in i:
-                    self.mon_iface = i
-                    break
-        
-        if self.mon_iface:
-            self.log(f"[就绪] 监听接口: {self.mon_iface}")
+        # 核心修复：优先检查原物理接口
+        if self.core.check_monitor_mode(physical):
+            self.mon_iface = physical
+            self.log(f"[就绪] 监听接口: {physical} (原接口直接切换)")
+            self.set_monitor_status("on")
             self._do_scan()
-        else:
-            self.log("[错误] 监听模式开启失败")
-            self.btn_scan.setEnabled(True)
-            self.btn_stop_scan.setEnabled(False)
-            self.set_status("监听模式开启失败")
+            return
+
+        # 兜底：查找名字含 mon 的新接口
+        for iface in self.core.list_interfaces():
+            if "mon" in iface and physical in iface:
+                if self.core.check_monitor_mode(iface):
+                    self.mon_iface = iface
+                    self.log(f"[就绪] 监听接口: {iface}")
+                    self.set_monitor_status("on")
+                    self._do_scan()
+                    return
+
+        self.log("[错误] 监听模式开启失败：未检测到 monitor 接口")
+        self.set_monitor_status("error")
+        self.btn_scan.setEnabled(True)
+        self.btn_stop_scan.setEnabled(False)
+        self.set_status("监听模式开启失败")
 
     def _do_scan(self):
         """实际开始 airodump-ng 扫描"""
@@ -205,6 +265,7 @@ class EasyAirApp(MainUI):
         self.scan_thread.line_out.connect(self.log)
         self.scan_thread.start()
         self.scan_timer.start()
+        self.set_scan_status("scanning")
         self.set_status("扫描中... 点击'停止扫描'查看列表")
 
     def _stop_scan(self):
@@ -216,6 +277,7 @@ class EasyAirApp(MainUI):
         self._auto_stop_monitor()
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
+        self.set_scan_status("idle")
         self.set_status("扫描已停止")
 
     def _find_latest_csv(self):
@@ -242,7 +304,6 @@ class EasyAirApp(MainUI):
                 essid = ','.join(parts[13:]).strip().strip('"')
                 if not bssid:
                     continue
-                # 信号强度转为图标
                 try:
                     pwr_int = int(pwr)
                     if pwr_int >= -50:
@@ -267,7 +328,6 @@ class EasyAirApp(MainUI):
             self.log(f"[解析失败] {e}")
 
     def _on_ap_double_clicked(self, row, col):
-        """双击 AP 选择为目标"""
         self._select_target(row)
 
     def _select_target(self, row):
@@ -308,7 +368,6 @@ class EasyAirApp(MainUI):
         self.cap_thread.line_out.connect(self.log)
         self.cap_thread.start()
         
-        # 定时检查握手包
         self.cap_check_timer = QTimer(self)
         self.cap_check_timer.timeout.connect(self._check_handshake)
         self.cap_check_timer.setInterval(2000)
@@ -358,7 +417,6 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "提示", "请先在'字典管理'中添加字典文件")
             return
 
-        # 添加到结果列表
         essid = self.lbl_target_essid.text()
         bssid = self.lbl_target_bssid.text()
         self.current_crack_item = self.crack_result.add_target(bssid, essid, str(cap))
@@ -410,18 +468,14 @@ class EasyAirApp(MainUI):
         self.conv_thread.start()
 
     def _on_crack_output(self, line):
-        """解析破解输出，提取密码"""
         self.log(line)
-        # 简单解析：查找 KEY FOUND 或 password
         if "KEY FOUND" in line or "FOUND" in line.upper():
-            # 尝试提取密码
             import re
             match = re.search(r'\[(.*?)\]', line) or re.search(r'KEY FOUND.*?(\S+)', line)
             if match:
                 pwd = match.group(1)
                 self.crack_result.update_progress(self.current_crack_item, pwd, self._format_elapsed())
                 return
-            # 兜底：整行作为密码
             self.crack_result.update_progress(self.current_crack_item, line.strip(), self._format_elapsed())
 
     def _update_crack_timer(self):
@@ -443,7 +497,6 @@ class EasyAirApp(MainUI):
         self.btn_stop_crack.setEnabled(False)
         
         if self.current_crack_item:
-            # 检查是否已有密码
             pwd = self.current_crack_item.text(2)
             if not pwd or pwd == "破解中...":
                 self.crack_result.set_failed(self.current_crack_item, "未找到密码")
@@ -469,7 +522,6 @@ class EasyAirApp(MainUI):
         self.set_status("破解已停止")
 
     def _export_results(self):
-        # 导出结果到 CSV
         fn, _ = QFileDialog.getSaveFileName(self, "导出结果", str(Path.home() / "easyair_results.csv"), "CSV Files (*.csv)")
         if fn:
             try:
