@@ -238,6 +238,7 @@ class MainUI(QWidget):
         # 扫描/抓包控制
         ctrl_layout = QHBoxLayout()
         self.btn_scan = QPushButton("🔍 开始扫描")
+        print(f"DEBUG: Created btn_scan: {self.btn_scan}")
         self.btn_scan.setMinimumHeight(36)
         self.btn_scan.setStyleSheet("font-weight: bold; background: #1976d2; color: white;")
         self.btn_stop_scan = QPushButton("⏹ 停止扫描")
