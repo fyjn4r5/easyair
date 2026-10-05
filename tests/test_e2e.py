@@ -201,13 +201,21 @@ def main():
     essids = [w.ap_table.item(r, 1).text() for r in range(w.ap_table.rowCount())]
     check("带逗号 SSID 正确", "Cafe, Guest" in essids, str(essids[-3:]))
     check("SSID 无多余引号", all('"' not in e for e in essids), str(essids[-3:]))
-    check("信道列正确", w.ap_table.item(0, 3).text() == "1", w.ap_table.item(0, 3).text())
-    check("加密列正确", w.ap_table.item(0, 4).text() == "WPA2/AES", w.ap_table.item(0, 4).text())
-    check("SSID 不是 ID-length", w.ap_table.item(0, 1).text() == "Net0",
-          w.ap_table.item(0, 1).text())
-    check("认证列不是 Power", w.ap_table.item(0, 5).text() in ("WPA", "Open", "WEP"),
-          w.ap_table.item(0, 5).text())
-    check("信号列带 dBm", w.ap_table.item(0, 6).text().endswith("dBm"),
+
+    # 行顺序已按信号强度降序, 用 BSSID 定位行而不是写死第0 行
+    row_of = {}
+    for r in range(w.ap_table.rowCount()):
+        row_of[w.ap_table.item(r, 1).text()] = r
+    r0 = row_of["Net0"]
+    check("信道列正确", w.ap_table.item(r0, 3).text() == "1",
+          w.ap_table.item(r0, 3).text())
+    check("加密列正确", w.ap_table.item(r0, 4).text() == "WPA2/AES",
+          w.ap_table.item(r0, 4).text())
+    check("SSID 不是 ID-length", w.ap_table.item(r0, 1).text() == "Net0",
+          w.ap_table.item(r0, 1).text())
+    check("认证列不是 Power", w.ap_table.item(r0, 5).text() in ("WPA", "Open", "WEP"),
+          w.ap_table.item(r0, 5).text())
+    check("信号列带 dBm", w.ap_table.item(r0, 6).text().endswith("dBm"),
           w.ap_table.item(0, 6).text())
 
     section("扫描 CSV: 表头别名与旧格式兼容")
@@ -515,6 +523,187 @@ def main():
     w2.core.config.update(dlg3.values())
     w2.auto_monitor_enabled = w2.core.config["auto_monitor"]
     check("取消勾选后为 False", w2.auto_monitor_enabled is False)
+
+    section("设置: 持久化与 GPU 温度上限")
+    cfgdir = tmp / "config"
+    cfgdir.mkdir(exist_ok=True)
+    C.CONFIG_FILE = cfgdir / "settings.json"
+    C.HISTORY_FILE = cfgdir / "history.json"
+    w.core.save_config()
+    check("配置已落盘", (cfgdir / "settings.json").exists())
+
+    dlg4 = U.CrackSettingsDialog(w, w.core.config)
+    check("默认温度上限为 85", dlg4.temp_limit.value() == 85,
+          str(dlg4.temp_limit.value()))
+    check("温度范围 0-110", dlg4.temp_limit.minimum() == 0
+          and dlg4.temp_limit.maximum() == 110)
+    check("0 表示不限制", dlg4.temp_limit.specialValueText() == "不限制")
+    dlg4.temp_limit.setValue(75)
+    dlg4.scan_secs.setValue(60)
+    dlg4.auto_mon.setChecked(False)
+    v4 = dlg4.values()
+    check("values 含温度上限", v4["hashcat_temp_limit"] == 75, str(v4))
+    w.core.config.update(v4)
+    w.core.save_config()
+    saved = C.json.load(open(C.CONFIG_FILE))
+    check("温度上限已持久化", saved.get("hashcat_temp_limit") == 75, str(saved))
+    check("扫描停止已持久化", saved.get("scan_auto_stop") == 60, str(saved))
+    check("auto_monitor 已持久化", saved.get("auto_monitor") is False, str(saved))
+
+    C.CONFIG_FILE = C.Path.home() / ".easyair" / "config" / "settings.json"
+    w.core.config["crack_engine"] = "Aircrack-ng (CPU)"
+    w.core.config["crack_device"] = "CPU"
+    w.core.save_config()
+    check("打包后写入用户目录", C.CONFIG_FILE.exists(),
+          str(C.CONFIG_FILE))
+    check("用户目录为 ~/.easyair",
+          C.CONFIG_FILE.parent.parent.name == ".easyair",
+          str(C.CONFIG_FILE))
+    w.core.config["crack_engine"] = "Hashcat (GPU/CPU)"
+    w.core.config["crack_device"] = "GPU + CPU (自动)"
+    w.core.config["auto_monitor"] = True
+    w.core.save_config()
+
+    section("设置: 温度参数注入破解命令")
+    w.core.config["hashcat_temp_limit"] = 85
+    check("运行时温度上限=85", w._temp_limit() == 85, str(w._temp_limit()))
+    check("生成 hwmon 参数", w._hwmon_args() == "--hwmon-temp-abort=85",
+          w._hwmon_args())
+    cmds = []
+    w.core.run_cmd = lambda cmd, sudo=False, shell=False: cmds.append(cmd)
+    w.core.crack_hashcat("/tmp/x.hc22000", ["/tmp/w.txt"], True, "", 85)
+    check("命令含温度上限", "--hwmon-temp-abort=85" in cmds[-1], cmds[-1])
+    check("命令含设备参数", "-D 1,2" in cmds[-1], cmds[-1])
+    w.core.crack_hashcat("/tmp/x.hc22000", ["/tmp/w.txt"], False, "", 0)
+    check("不限温时不加该参数", "--hwmon-temp-abort" not in cmds[-1], cmds[-1])
+    w.core.config["hashcat_temp_limit"] = 0
+    check("配置为 0 时不限温", w._temp_limit() == 0 and w._hwmon_args() == "")
+    w.core.config["hashcat_temp_limit"] = 85
+
+    section("客户端识别: Station 段解析")
+    sta_txt = (
+        "Station MAC, First time seen, Last time seen, Power, # packets, BSSID,"
+        " Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1,"
+        " E0:B6:68:CD:BB:F7,\r\n"
+        "52:2A:D2:7A:67:CB, 2026-10-05 16:19:39, 2026-10-05 16:19:39, -71, 1,"
+        " F0:1B:24:92:B1:EE,\r\n"
+        "3E:4F:76:13:3B:8B, 2026-10-05 16:19:49, 2026-10-05 16:19:49, -71, 2,"
+        " F0:1B:24:92:B1:EE,\r\n"
+        "3A:27:4A:5E:5F:64, 2026-10-05 16:19:26, 2026-10-05 16:19:26, -69, 4,"
+        " (not associated) ,CMCC-8822,HomeInns\r\n")
+    st = w._parse_station_section(sta_txt)
+    check("按 BSSID 分组", sorted(st) == ["E0:B6:68:CD:BB:F7", "F0:1B:24:92:B1:EE"],
+          str(sorted(st)))
+    check("单个客户端", len(st["E0:B6:68:CD:BB:F7"]) == 1)
+    check("多个客户端", len(st["F0:1B:24:92:B1:EE"]) == 2, str(st))
+    check("排除未关联客户端", "(not associated)" not in str(st), str(st))
+    check("忽略 \\r 行尾", all("\r" not in c["mac"] for v in st.values() for c in v))
+    check("空段返回空字典", w._parse_station_section("") == {})
+    check("纯表头不报错",
+          w._parse_station_section("Station MAC, First time seen\r\n") == {})
+
+    check("AP 表为 8 列", w.ap_table.columnCount() == 8, str(w.ap_table.columnCount()))
+    col_hdr = [w.ap_table.horizontalHeaderItem(i).text() for i in range(8)]
+    check("最后一列为客户端", col_hdr[7] == "客户端", str(col_hdr))
+
+    csvx = tmp / "captures" / "scan-01.csv"
+    csvx.write_text(
+        hdr + "\n"
+        "AA:BB:CC:DD:EE:01, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -40,  4,  0,   0.  0.  0.  0,   3, WithCli, \n"
+        "AA:BB:CC:DD:EE:02, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -40,  4,  0,   0.  0.  0.  0,   3, NoCli, \n"
+        "Station MAC, First time seen, Last time seen, Power, # packets, BSSID,"
+        " Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1,"
+        " AA:BB:CC:DD:EE:01,\r\n"
+        "52:2A:D2:7A:67:CB, 2026-10-05 16:19:39, 2026-10-05 16:19:39, -71, 1,"
+        " AA:BB:CC:DD:EE:01,\r\n")
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    cells = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 7).text()
+             for r in range(w.ap_table.rowCount())}
+    check("有客户端的 AP 显示数量", cells.get("WithCli", "").startswith("2"),
+          str(cells))
+    check("显示客户端 MAC", "0E:BE" in cells.get("WithCli", ""), str(cells))
+    check("无客户端显示 0", cells.get("NoCli", "").startswith("0"), str(cells))
+    check("状态栏提示有客户端", "有客户端" in w.status_label.text(),
+          w.status_label.text())
+
+    # 还原 16 个 AP 的 fixture, 供后续信号排序用例使用
+    csv.write_text(
+        hdr + "\n" + "\n".join(ap_line(i) for i in range(15)) + "\n"
+        + '11:22:33:44:55:66, 2026-10-05 10:00:00, 2026-10-05 10:00:02, 6, 270,'
+          ' WPA2, AES, PSK, -33,  9,  0,   0.  0.  0.  0,  11, "Cafe, Guest", \n')
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    check("fixture 还原为 16 行", w.ap_table.rowCount() == 16,
+          str(w.ap_table.rowCount()))
+
+    section("AP 列表: 信号排序与信号格")
+    pwrs = [int(w.ap_table.item(r, 6).text().split()[0]) for r in range(w.ap_table.rowCount())]
+    check("按信号强度降序", pwrs == sorted(pwrs, reverse=True), str(pwrs))
+    check("最强信号排第一", w.ap_table.item(0, 1).text() == "Cafe, Guest",
+          w.ap_table.item(0, 1).text())
+    bars = [w.ap_table.item(r, 0).text() for r in range(w.ap_table.rowCount())]
+    check("信号格为方块字符", all(set(b) <= set("█░") for b in bars), str(bars[:3]))
+    check("不再使用竖线表示信号", not any("|" in b for b in bars), str(bars[:3]))
+    check("最强信号格全满", bars[0] == "█████", bars[0])
+    weak = min(range(w.ap_table.rowCount()),
+               key=lambda r: int(w.ap_table.item(r, 6).text().split()[0]))
+    check("最弱信号格只有一格",
+          w.ap_table.item(weak, 0).text().count("█") == 1,
+          w.ap_table.item(weak, 0).text())
+    check("-40dBm 档位", w._signal_bar(-40) == ("█████", "#2e7d32"), str(w._signal_bar(-40)))
+    check("-65dBm 档位", w._signal_bar(-65) == ("███░░", "#f9a825"), str(w._signal_bar(-65)))
+    check("-95dBm 档位", w._signal_bar(-95) == ("█░░░░", "#c62828"), str(w._signal_bar(-95)))
+    check("无信号时全空", w._signal_bar(None)[0] == "░░░░░", str(w._signal_bar(None)))
+
+    section("界面流畅度与日期完整显示")
+    from PyQt5.QtWidgets import QSplitter
+    sps = [s for s in w.findChildren(QSplitter)]
+    check("存在分割器", len(sps) >= 2, str(len(sps)))
+    check("分割器为不透明拖动", all(s.opaqueResize() for s in sps),
+          str([s.opaqueResize() for s in sps]))
+    from PyQt5.QtWidgets import QHeaderView
+    vh = w.ap_table.verticalHeader()
+    check("AP 表行高固定",
+          vh.sectionResizeMode(0) == QHeaderView.Fixed,
+          str(vh.sectionResizeMode(0)))
+    check("AP 表按像素滚动",
+          w.ap_table.verticalScrollMode() == w.ap_table.ScrollPerPixel)
+    from PyQt5.QtCore import Qt as _Qt
+    check("历史 tab 不省略文字",
+          w.result_tabs.tabBar().elideMode() == _Qt.ElideNone,
+          str(w.result_tabs.tabBar().elideMode()))
+    check("历史 tab 用滚动按钮",
+          w.result_tabs.usesScrollButtons() is True)
+
+    section("扫描时长与倒计时在底部任务栏")
+    from PyQt5.QtWidgets import QFrame
+    top_bar = w.findChild(QFrame, "targetBar")
+    check("存在目标栏", top_bar is not None)
+    status_line = None
+    for fr in w.findChildren(QFrame):
+        if fr.objectName() == "targetBar" and fr is not top_bar:
+            status_line = fr
+            break
+    check("存在底部状态行", status_line is not None)
+    if status_line is not None:
+        check("时长标签在底部状态行",
+              status_line.isAncestorOf(w.scan_elapsed),
+              "scan_elapsed 不在底部")
+        check("时长标签不在顶部目标栏",
+              not top_bar.isAncestorOf(w.scan_elapsed))
+    w.scan_start_time = time.time() - 65
+    w.scan_deadline = time.time() + 30
+    txt = w._scan_elapsed_text()
+    check("底部文本含扫描时长", "扫描时长" in txt, txt)
+    check("底部文本含倒计时", "后自动停止" in txt, txt)
+    w._stop_scan()
+    check("停止后清空时长", w.scan_elapsed.text() == "",
+          repr(w.scan_elapsed.text()))
 
     section("关闭时清理线程")
     w2.close()

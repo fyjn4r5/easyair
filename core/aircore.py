@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import shutil
 import subprocess
@@ -9,8 +10,22 @@ import binascii
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-CONFIG_FILE = Path(__file__).parent.parent / "config" / "settings.json"
-HISTORY_FILE = Path(__file__).parent.parent / "config" / "history.json"
+APP_NAME = "easyair"
+
+
+def _data_dir() -> Path:
+    """数据目录。
+
+    打包成 onefile 后 `__file__` 位于 PyInstaller 的临时解压目录
+    (/tmp/_MEIxxxxxx/), 重启即被删除 —— 配置/历史/抓包都会丢失。
+    因此打包后一律放到用户主目录下的固定路径。"""
+    if getattr(sys, "frozen", False):
+        return Path.home() / f".{APP_NAME}"
+    return Path(__file__).parent.parent
+
+
+CONFIG_FILE = _data_dir() / "config" / "settings.json"
+HISTORY_FILE = _data_dir() / "config" / "history.json"
 PAS_FILE = Path.home() / ".Pas"
 
 import datetime
@@ -20,8 +35,8 @@ def today_str() -> str:
     return datetime.date.today().isoformat()
 
 class AirCore:
-    def __init__(self, base_dir: Path):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: Optional[Path] = None):
+        self.base_dir = Path(base_dir) if base_dir else _data_dir()
         self.caps_dir = self.base_dir / "captures"
         self.wordlists_dir = self.base_dir / "wordlists"
         self.config_dir = self.base_dir / "config"
@@ -39,6 +54,7 @@ class AirCore:
             "hashcat_extra_args": "",
             "auto_monitor": True,
             "scan_auto_stop": 0,
+            "hashcat_temp_limit": 85,
             "crack_engine": "Hashcat (GPU/CPU)",
             "crack_device": "GPU + CPU (自动)",
         }
@@ -51,8 +67,9 @@ class AirCore:
 
     def save_config(self):
         try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(CONFIG_FILE, 'w') as f:
-                json.dump(self.config, f, indent=2)
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
         except OSError as e:
             print(f"[配置保存失败] {e}")
 
@@ -404,10 +421,21 @@ class AirCore:
         cmd = f"hcxpcapngtool '{cap}' -o '{out_hc}'"
         return self.run_cmd(cmd)
 
-    def crack_hashcat(self, hc_file: str, wordlists: List[str], use_gpu: bool = True, extra_args: str = ""):
+    def crack_hashcat(self, hc_file: str, wordlists: List[str], use_gpu: bool = True,
+                      extra_args: str = "", temp_limit: int = 0):
+        """temp_limit>0 时附加 --hwmon-temp-abort, 达到温度上限自动中止,
+        避免长时间破解把 GPU 烤坏(0 表示不限温)。"""
         device_arg = "-D 1,2" if use_gpu else "-D 1"
         wl_args = " ".join(f"'{w}'" for w in wordlists)
-        cmd = f"hashcat -m 22000 {device_arg} {extra_args} '{hc_file}' {wl_args}"
+        hwmon = ""
+        try:
+            tl = int(temp_limit)
+        except (TypeError, ValueError):
+            tl = 0
+        if tl > 0:
+            hwmon = f"--hwmon-temp-abort={tl} "
+        cmd = (f"hashcat -m 22000 {device_arg} {hwmon}{extra_args} "
+               f"'{hc_file}' {wl_args}")
         return self.run_cmd(cmd)
 
     def get_latest_handshake(self) -> Optional[Path]:

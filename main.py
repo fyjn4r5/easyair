@@ -2,6 +2,7 @@
 import sys
 import os
 import io
+import threading
 import re
 import time
 import shutil
@@ -15,6 +16,9 @@ from PyQt5.QtGui import QFont, QColor
 
 from ui.main_ui import MainUI, WordListDialog, CrackSettingsDialog, CrackResultWidget
 from core.aircore import AirCore, today_str
+
+# 停不掉的 QThread 保活集合: 丢弃引用会触发 abort, 见 _stop_threads
+_KEEP_ALIVE = set()
 
 
 class CmdThread(QThread):
@@ -72,7 +76,8 @@ class FuncThread(QThread):
 class EasyAirApp(MainUI):
     def __init__(self):
         super().__init__()
-        self.core = AirCore(Path(__file__).parent)
+        # 打包后必须用稳定目录, 否则配置/历史会随临时目录一起消失
+        self.core = AirCore()
         self.scan_thread = None
         self.cap_thread = None
         self.crack_thread = None
@@ -113,17 +118,32 @@ class EasyAirApp(MainUI):
         self._refresh_cap_tree()
 
     def closeEvent(self, event):
+        """退出必须快速返回。
+
+        原来这里同步跑 stop_monitor(含 sudo 校验, 最长 10s) 并逐个
+        wait(2000) 等线程, 会让窗口长时间"未响应"甚至被强杀。
+        现在: 先停子进程(有界等待), 监听接口交给后台线程收尾,
+        残留的 mon 接口下次启动时 _cleanup_monitor 会清理。"""
         try:
             self._persist_record()
         except Exception as e:  # noqa: BLE001
             print(f"[退出] 保存进度失败: {e}")
-        if self.mon_iface:
-            self.log(f"[退出] 关闭监听模式: {self.mon_iface}")
-            try:
-                self.core.stop_monitor(self.mon_iface)
-            except Exception as e:
-                print(f"[退出] 关闭监听模式失败: {e}")
+
+        mon = self.mon_iface
+        self.mon_iface = None
         self._stop_threads()
+
+        if mon:
+            def _cleanup(m=mon):
+                try:
+                    self.core.stop_monitor(m)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[退出] 关闭监听失败: {e}")
+
+            t = threading.Thread(target=_cleanup, daemon=True)
+            t.start()
+            _KEEP_ALIVE.add(t)
+
         super().closeEvent(event)
 
     def _bind(self):
@@ -199,22 +219,28 @@ class EasyAirApp(MainUI):
         return t
 
     def _stop_threads(self):
+        """终止子进程与工作线程。
+
+        注意: 不能在线程仍在运行时丢弃引用 —— QThread 一旦被 GC 就会
+        触发 "QThread: Destroyed while thread is still running" 并 abort
+        整个进程(表现为界面被强制结束)。停不掉的线程交给模块级集合
+        保活到进程退出。"""
         for t in list(self._threads):
             if isinstance(t, CmdThread):
                 t.stop()
         for t in list(self._threads):
             try:
-                if t.isRunning():
-                    t.wait(2000)
+                if t.isRunning() and not t.wait(700):
+                    _KEEP_ALIVE.add(t)
             except RuntimeError:
-                pass
+                _KEEP_ALIVE.add(t)
         self._threads.clear()
         for w in list(self._workers):
             try:
-                if w.isRunning():
-                    w.wait(2000)
+                if w.isRunning() and not w.wait(700):
+                    _KEEP_ALIVE.add(w)
             except RuntimeError:
-                pass
+                _KEEP_ALIVE.add(w)
         self._workers.clear()
 
     # ===== 日志 =====
@@ -375,8 +401,10 @@ class EasyAirApp(MainUI):
         self.scan_auto_stop = vals["scan_auto_stop"]
         self._refresh_engine_label()
         self.log(f"[设置] 引擎={vals['crack_engine']} | 设备={vals['crack_device']}")
+        self.log(f"[设置] GPU 温度上限={vals['hashcat_temp_limit'] or '不限制'}")
         self.log(f"[设置] 扫描自动停止="
                  f"{self.scan_auto_stop}s" if self.scan_auto_stop else "[设置] 扫描需手动停止")
+        self.set_status("设置已保存")
 
     def _refresh_engine_label(self):
         engine = self.core.config.get("crack_engine", "Hashcat (GPU/CPU)")
@@ -675,6 +703,8 @@ class EasyAirApp(MainUI):
         self.set_status("扫描中 · 仍未捕获 AP，请查看日志建议")
 
     def _scan_elapsed_text(self):
+        if not self.scan_start_time:
+            return ""
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
         if self.scan_deadline:
             left = int(self.scan_deadline - time.time())
@@ -691,6 +721,8 @@ class EasyAirApp(MainUI):
                 self.scan_thread = None
             self.scan_timer.stop()
             self.scan_deadline = None
+            self.scan_start_time = 0.0
+            self.scan_elapsed.setText("")
             self._parse_scan_csv(force=True)
             self.btn_scan.setEnabled(True)
             self.btn_stop_scan.setEnabled(False)
@@ -739,41 +771,35 @@ class EasyAirApp(MainUI):
         self._last_csv = sig
         try:
             txt = csv.read_text(errors="ignore", encoding="utf-8")
-            
-            # 1. 分离 AP 部分和 Station 部分
+            # airodump CSV 分两段: AP 段 + Station 段, 以 "Station MAC" 表头分隔
             if "Station MAC" in txt:
                 ap_sec, station_sec = txt.split("Station MAC", 1)
             else:
                 ap_sec, station_sec = txt, ""
-            
-            # 解析 Station 部分：按 BSSID 分组客户端
-            stations_by_bssid = {}
-            for line in station_sec.splitlines():
-                line = line.strip()
-                if not line or line.startswith(("Station MAC", "Interface")):
-                    continue
-                parts = re.split(r',\s*', line)
-                if len(parts) >= 6:
-                    station_mac = parts[0]
-                    bssid = parts[5]
-                    power = parts[3]
-                    packets = parts[4]
-                    stations_by_bssid.setdefault(bssid, []).append({
-                        'mac': station_mac, 'power': power, 'packets': packets
-                    })
-            
-            # 解析 AP 部分
+            stations_by_bssid = self._parse_station_section(station_sec)
             rows = self._parse_ap_csv(ap_sec, stations_by_bssid)
             if rows:
                 self.ap_table.setUpdatesEnabled(False)
                 self.ap_table.setRowCount(len(rows))
                 for i, r in enumerate(rows):
-                    for c, v in enumerate(r):
-                        self.ap_table.setItem(i, c, QTableWidgetItem(v))
+                    pwr_int, cli_count = r[0], r[8]
+                    for c, v in enumerate(r[1:], start=1):
+                        it = QTableWidgetItem(v)
+                        if c in (2, 7):
+                            it.setToolTip(str(v))
+                        if c == 7 and cli_count:
+                            it.setForeground(QColor("#1565c0"))
+                        self.ap_table.setItem(i, c, it)
+                    bar, color = self._signal_bar(pwr_int)
+                    it = QTableWidgetItem(bar)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setForeground(QColor(color))
+                    self.ap_table.setItem(i, 0, it)
                 self.ap_table.setUpdatesEnabled(True)
                 self.scan_elapsed.setText(self._scan_elapsed_text())
-                ap_with_clients = sum(1 for r in rows if len(r) > 7 and not r[7].startswith("0客户端"))
-                self.set_status(f"发现 {len(rows)} 个 AP，{ap_with_clients} 个有客户端 - 双击选择目标")
+                n_cli = sum(1 for r in rows if r[8])
+                tip = f", {n_cli} 个有客户端" if n_cli else ""
+                self.set_status(f"发现 {len(rows)} 个 AP{tip} - 双击选择目标")
         except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
@@ -791,6 +817,33 @@ class EasyAirApp(MainUI):
         "power": ("power", "dbm", "signal"),
         "station": ("stationmac", "station"),
     }
+
+    @staticmethod
+    def _parse_station_section(station_sec: str) -> dict:
+        """解析 airodump CSV 的 Station 段, 返回 {BSSID: [客户端...]}。
+
+        实测格式(行尾带 \\r):
+        Station MAC, First time seen, Last time seen, Power, # packets,
+        BSSID, Probed ESSIDs
+        未关联的客户端 BSSID 为 "(not associated)", 不计入任何 AP。
+        """
+        out = {}
+        for raw in station_sec.splitlines():
+            line = raw.strip().strip("\r")
+            if not line or line.startswith(("Station MAC", "Interface")):
+                continue
+            parts = re.split(r',\s*', line)
+            if len(parts) < 6:
+                continue
+            mac, power, packets, bssid = (parts[0].strip(), parts[3].strip(),
+                                          parts[4].strip(), parts[5].strip().upper())
+            if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", mac):
+                continue
+            if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", bssid):
+                continue  # (not associated) 等
+            out.setdefault(bssid, []).append(
+                {"mac": mac.upper(), "power": power, "packets": packets})
+        return out
 
     @staticmethod
     def _norm_col(name: str) -> str:
@@ -854,23 +907,43 @@ class EasyAirApp(MainUI):
                 essid = "(隐藏)"
             try:
                 pwr_int = int(float(pwr))
-                bars = "|||" if pwr_int >= -50 else ("||" if pwr_int >= -70 else "|")
-            except ValueError:
-                bars = ""
+                # airodump 用 -1 表示"尚未收到 beacon, 信号未知",
+                # 不能当成 -1dBm 的最强信号排到最前
+                if pwr_int >= 0 or pwr_int == -1:
+                    pwr_int = None
+            except (TypeError, ValueError):
+                pwr_int = None
             enc_col = f"{priv}/{cipher}".strip("/") if cipher else priv
-            # 客户端信息
-            clients = stations_by_bssid.get(bssid, []) if stations_by_bssid else []
+            # 客户端信息: 第 8 列(真实存在于 airodump CSV 的 Station 段)
+            clients = stations_by_bssid.get(bssid.upper(), []) if stations_by_bssid else []
             client_count = len(clients)
-            client_str = f"{client_count}客户端"
+            client_str = f"{client_count} 客户端"
             if clients:
-                client_macs = ', '.join([c['mac'] for c in clients[:3]])
-                if len(clients) > 3:
-                    client_macs += f" 等{len(clients)}个"
-                client_str = f"{client_count}客户端: {client_macs}"
-            
-            rows.append((bars, essid, bssid.upper(), ch, enc_col, auth,
-                         f"{pwr} dBm" if pwr else "", client_str))
+                macs = ", ".join(c["mac"] for c in clients[:2])
+                if client_count > 2:
+                    macs += f" 等{client_count}个"
+                client_str = f"{client_count} 客户端: {macs}"
+
+            rows.append((pwr_int, essid, bssid.upper(), ch, enc_col, auth,
+                         f"{pwr} dBm" if pwr else "", client_str, client_count))
+        # 信号强的排前面(未知信号沉底)
+        rows.sort(key=lambda r: (r[0] is None, -(r[0] if r[0] is not None else 0)))
         return rows
+
+    @staticmethod
+    def _signal_bar(pwr_int):
+        """信号格: 用方块字符画条, 返回(文本, 颜色)。"""
+        if pwr_int is None:
+            return "░░░░░", "#b0bec5"
+        if pwr_int >= -50:
+            return "█████", "#2e7d32"
+        if pwr_int >= -60:
+            return "████░", "#7cb342"
+        if pwr_int >= -70:
+            return "███░░", "#f9a825"
+        if pwr_int >= -80:
+            return "██░░░", "#ef6c00"
+        return "█░░░░", "#c62828"
 
     def _on_ap_double_clicked(self, row, col):
         self._select_target(row)
@@ -968,6 +1041,16 @@ class EasyAirApp(MainUI):
                              lambda p: setattr(self, 'mon_iface', None))
 
     # ===== 破解 =====
+    def _temp_limit(self) -> int:
+        try:
+            return int(self.core.config.get("hashcat_temp_limit", 85) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _hwmon_args(self) -> str:
+        tl = self._temp_limit()
+        return f"--hwmon-temp-abort={tl}" if tl else ""
+
     def _resolve_cap(self) -> Optional[Path]:
         """优先用握手包库选中项，否则用最新握手包"""
         sel = self.cap_tree.selectedItems()
@@ -1046,9 +1129,13 @@ class EasyAirApp(MainUI):
         use_gpu = device != "仅 CPU"
         extra = self.core.config.get("hashcat_extra_args", "")
         self.log_crack(
-            f"> hashcat -m 22000 {'-D 1,2' if use_gpu else '-D 1'} {extra} '{hc}' {' '.join(wordlists)}")
+            f"> hashcat -m 22000 {'-D 1,2' if use_gpu else '-D 1'} {self._hwmon_args()}"
+            f" {extra} '{hc}' {' '.join(wordlists)}")
+        tl = self._temp_limit()
+        if tl:
+            self.log_crack(f"[保护] GPU 温度上限 {tl}°C，达到即自动中止")
         self._run_worker(
-            lambda: self.core.crack_hashcat(str(hc), wordlists, use_gpu, extra),
+            lambda: self.core.crack_hashcat(str(hc), wordlists, use_gpu, extra, tl),
             self._on_crack_proc)
         self.log_crack("[破解中] Hashcat 正在跑字典...")
 
