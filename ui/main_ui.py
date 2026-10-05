@@ -303,7 +303,7 @@ class MainUI(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         # 标题带版本号: 之前多个版本并存, 无法判断跑的是哪个构建
-        ver = "1.12.3"
+        ver = "1.12.4"
         try:
             import main as _m
             ver = getattr(_m, "VERSION", ver)
@@ -728,6 +728,20 @@ class MainUI(QWidget):
             self.activateWindow()
 
     def set_monitor_status(self, status: str):
+        # 关键: 用代码改 checked 状态时必须 blockSignals。
+        # btn_mon_toggle.toggled 连着 _on_mon_toggle, 一旦信号真的发出去,
+        # "开启成功"会再触发一次 start_monitor(实测 _apply_mon_iface 走
+        # set_monitor_status("on") 就多开一次 airmon-ng), "关闭/错误"分支的
+        # setChecked(False) 还会反向触发一次 stop_monitor。
+        # 即"汇报状态"变成了"再次操作"。
+        btn = self.btn_mon_toggle
+        btn.blockSignals(True)
+        try:
+            self._set_monitor_status_inner(status)
+        finally:
+            btn.blockSignals(False)
+
+    def _set_monitor_status_inner(self, status: str):
         if status == "off":
             self.btn_mon_toggle.setChecked(False)
             self.btn_mon_toggle.setIcon(self.icon_off)

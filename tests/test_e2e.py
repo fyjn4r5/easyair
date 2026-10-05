@@ -1303,6 +1303,99 @@ def main():
           t.item(0, 2).toolTip())
     (_cd3 / "scan-01.csv").unlink(missing_ok=True)
 
+    # ---- 跨线程日志与监听开关重复触发 ----
+    # 回归: 工作线程里 self.log() 直接 appendPlainText 会让 Qt 报
+    # "Cannot queue arguments of type 'QTextBlock'/'QTextCursor'" 并段错误;
+    # 另外 set_monitor_status 改 checked 会把信号发出去, 让"汇报状态"
+    # 变成"再次开启/关闭监听"。
+    section("跨线程日志与监听开关")
+    from PyQt5.QtCore import QThread as _QT
+
+    _calls = {"start": [], "stop": []}
+
+    class _FakeCore:
+        caps_dir = None
+
+        def list_interfaces(self):
+            return ["wlan0"]
+
+        def start_monitor(self, iface):
+            _calls["start"].append(iface)
+            import subprocess
+            return subprocess.Popen(["echo", "ALREADY_MONITOR"],
+                                    stdout=subprocess.PIPE, text=True)
+
+        def check_monitor_mode(self, _i):
+            return True
+
+        def stop_monitor(self, m):
+            _calls["stop"].append(m)
+            return None
+
+    _w3 = M.EasyAirApp()
+    _w3.core = _FakeCore()
+    _w3.iface_combo.clear()
+    _w3.iface_combo.addItem("wlan0")
+
+    _calls["start"].clear()
+    _ok = _w3._enable_monitor()
+    pump(300)
+    check("_enable_monitor 只开启一次", len(_calls["start"]) == 1,
+          str(_calls["start"]))
+    check("_enable_monitor 返回 True", _ok is True, str(_ok))
+    check("开启后开关为勾选态", _w3.btn_mon_toggle.isChecked())
+    _w3.mon_iface = None
+    _w3.btn_mon_toggle.setChecked(False)
+
+    _calls["start"].clear()
+    _calls["stop"].clear()
+    _w3.set_monitor_status("on")
+    pump(200)
+    check("set_monitor_status(on) 不重复开启", len(_calls["start"]) == 0,
+          str(_calls["start"]))
+    check("set_monitor_status(on) 开关为勾选态",
+          _w3.btn_mon_toggle.isChecked())
+    _w3.set_monitor_status("off")
+    pump(200)
+    check("set_monitor_status(off) 不误触发关闭", len(_calls["stop"]) == 0,
+          str(_calls["stop"]))
+    check("set_monitor_status(off) 开关为非勾选态",
+          not _w3.btn_mon_toggle.isChecked())
+
+    # 捕获 Qt 往 stderr 写的跨线程警告
+    import io as _io
+    _r, _wr = os.pipe()
+    _saved_err = os.dup(2)
+    os.dup2(_wr, 2)
+    os.close(_wr)
+
+    class _LogThread(_QT):
+        def run(self):
+            _w3.log("[deauth] 已自动发送 10 次解关联 → AA:BB:CC:DD:EE:FF")
+            _w3.log_crack("破解中")
+
+    _lt = _LogThread()
+    _lt.start()
+    _lt.wait()
+    pump(200)
+    os.dup2(_saved_err, 2)
+    os.close(_saved_err)
+    os.set_blocking(_r, False)
+    try:
+        _noise = os.read(_r, 65536).decode("utf-8", "replace")
+    except BlockingIOError:
+        _noise = ""
+    os.close(_r)
+    check("工作线程写日志无 Qt 跨线程警告",
+          "QTextBlock" not in _noise and "QTextCursor" not in _noise,
+          _noise.strip()[:120])
+    check("工作线程日志已进界面",
+          "deauth" in _w3.log_scan_box.toPlainText())
+    check("工作线程破解日志已进界面",
+          "破解中" in _w3.log_crack_box.toPlainText())
+    _w3.close()
+    pump(100)
+
     section("关闭时清理线程")
     w2.close()
     pump(100)

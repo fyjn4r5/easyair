@@ -124,6 +124,10 @@ class EasyAirApp(MainUI):
         self._threads = set()
         self._last_persist = 0.0
 
+        # 跨线程日志的唯一出口: Qt 自动连接在跨线程时就是 queued,
+        # 因此 appendPlainText 永远只在 GUI 线程跑。
+        self._log_line.connect(self._append_log)
+
         self._bind()
         self._load_wordlists()
         self._refresh_ifaces()
@@ -301,20 +305,29 @@ class EasyAirApp(MainUI):
             return False
         return True
 
+    # 工作线程写日志的唯一入口: 信号是 queued 的, appendPlainText 一定在
+    # GUI 线程执行。QPlainTextEdit 不是线程安全的, 跨线程直接调用会让 Qt 报
+    # "Cannot queue arguments of type 'QTextBlock'/'QTextCursor'" 并最终段错误。
+    _log_line = pyqtSignal(str, object)
+
+    def _append_log(self, kind: str, txt: str):
+        box = self.log_crack_box if kind == "crack" else self.log_scan_box
+        box.appendPlainText(txt)
+
     def log(self, txt: str):
         """抓包/扫描日志 (只收有意义的内容)"""
         if not self._should_log(txt):
             return
-        self.log_scan_box.appendPlainText(txt)
+        self._log_line.emit("scan", txt)
 
     def log_scan(self, txt: str):
         """子进程 stdout 入口 (airdump 等), 过滤噪音但保留扫描输出"""
         if self._should_log(txt):
-            self.log_scan_box.appendPlainText(txt)
+            self._log_line.emit("scan", txt)
 
     def log_crack(self, txt: str):
         """破解日志"""
-        self.log_crack_box.appendPlainText(txt)
+        self._log_line.emit("crack", txt)
 
     def set_status(self, txt: str):
         self.status_label.setText(txt)
@@ -345,9 +358,15 @@ class EasyAirApp(MainUI):
         self.set_monitor_status("starting")
         self.physical_iface = physical
         btn = self.btn_mon_toggle
-        was_checked = btn.isChecked()
-        btn.setChecked(True)          # 触发 _on_mon_toggle
-        btn.setChecked(was_checked)   # 还原: 开关已被禁用, 不代表用户意图
+        # 关键: 这里只同步开关外观, 绝不能让 toggled 信号真的发出去。
+        # btn.setChecked(True) 会触发 _on_mon_toggle, 那里同样会调
+        # start_monitor —— 于是同一次"开启监听"跑了两遍 airmon-ng,
+        # 两个线程同时对同一网卡 stop/start, 轻则日志重复(实际线上就是
+        # "[监听模式] 准备开启" 连打两次), 重则 airmon-ng 互相把对方的
+        # monitor 接口清掉, 表现为"刚开启就检测不到接口"。
+        btn.blockSignals(True)
+        btn.setChecked(True)
+        btn.blockSignals(False)
         btn.setEnabled(False)
 
         proc = None
@@ -1668,7 +1687,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.12.3"
+VERSION = "1.12.4"
 
 
 def _selftest() -> int:
