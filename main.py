@@ -102,6 +102,8 @@ class EasyAirApp(MainUI):
         # 几万小时, 且 -1 未知信号判断等判断全部失效
         self.scan_start_time = 0.0
         self.scan_deadline = None
+        self._cd_anchor_left = 0
+        self._last_clock_text = ""
         self._stopping_scan = False
         self._crack_running = False
         self._scan_warned = False
@@ -829,6 +831,8 @@ class EasyAirApp(MainUI):
         self.scan_deadline = (time.time() + self.scan_auto_stop
                                if self.scan_auto_stop > 0 else None)
         self._autostop_firing = False
+        self._cd_anchor_left = int(self.scan_auto_stop)
+        self._last_clock_text = ""
         self.tick_timer.start()
         self.scan_elapsed.setText(self._scan_elapsed_text())
         if self.scan_deadline:
@@ -920,11 +924,13 @@ class EasyAirApp(MainUI):
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
         if self.scan_deadline:
             left = self.scan_deadline - time.time()
-            if left <= 0:
-                base += " | 即将停止"
+            if left <= 1:
+                base += " | 1s 后自动停止"
             else:
-                # 向上取整: 否则 44.9s 会显示 44, 造成读数忽大忽小
-                base += f" | {int(left + 0.999)}s 后自动停止"
+                # 严格 1 秒 1 跳: 以首次取整为锚点, 每跨过一个整数边界
+                # 才减 1。之前每次都按当前剩余时间取整, 锚点会随 tick 漂移,
+                # 出现 3->2->3 这种来回跳。
+                base += f" | {self._countdown_num()}s 后自动停止"
         return base
 
     def _stop_scan(self):
@@ -939,6 +945,8 @@ class EasyAirApp(MainUI):
             self.tick_timer.stop()
             self.scan_deadline = None
             self.scan_start_time = 0.0
+            self._cd_anchor_left = 0
+            self._last_clock_text = ""
             self.scan_elapsed.setText("")
             self._parse_scan_csv(force=True)
             self.btn_scan.setEnabled(True)
@@ -1474,6 +1482,21 @@ class EasyAirApp(MainUI):
             if time.time() - self._last_persist >= 5.0:
                 self._persist_record()
 
+    def _countdown_num(self) -> int:
+        """以扫描启动瞬间为锚, 返回严格递减的倒计时秒数。
+
+        锚点只在开始扫描时算一次, 之后用 elapsed 整除得到秒数,
+        这样每个数字恰好停留 1 秒, 不会出现跳秒或回跳。"""
+        if not self._cd_anchor_left:
+            return 0
+        elapsed = time.time() - self.scan_start_time
+        # _cd_anchor_left 是开始时的剩余秒数(整数)。
+        # 向上取整: t=0 显示满值(6), t=1 显示 5 ... 每个数字正好停 1 秒。
+        # 用 int() 会立刻少 1 格, 起步就错位。
+        left = self._cd_anchor_left - elapsed
+        n = -int(-left // 1)  # 等价 math.ceil, 避免多 import
+        return n if n > 1 else 1
+
     def _tick_scan_clock(self):
         """仅刷新时长与倒计时(200ms), 不做任何解析或 IO。
 
@@ -1482,7 +1505,12 @@ class EasyAirApp(MainUI):
         """
         if not self.scan_start_time:
             return
-        self.scan_elapsed.setText(self._scan_elapsed_text())
+        # 200ms 一次的 tick 里绝大多数时候文本没变(如倒计时 5->5->5)。
+        # 无条件 setText 会白白触发重绘, 这是扫描时界面卡顿的主因之一。
+        txt = self._scan_elapsed_text()
+        if txt != self._last_clock_text:
+            self._last_clock_text = txt
+            self.scan_elapsed.setText(txt)
         if self.scan_deadline and time.time() >= self.scan_deadline:
             # 本槽每 200ms 进一次, 不置位会重复触发停止流程
             if getattr(self, "_autostop_firing", False):

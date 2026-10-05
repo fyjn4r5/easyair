@@ -1023,6 +1023,68 @@ def main():
           f"{w.ap_table.rowCount()} 行")
     w.ap_table.setRowCount(0)
 
+    # ---- 倒计时必须严格 1 秒 1 跳, 且只在变化时重绘 ----
+    section("倒计时 1 秒 1 跳 + 按需重绘")
+    w._stop_scan = lambda: None
+    w.scan_auto_stop = 5
+    w.scan_timer.stop()
+    w.scan_start_time = time.time()
+    w.scan_deadline = w.scan_start_time + 5
+    w._cd_anchor_left = 5
+    w._last_clock_text = ""
+    w._autostop_firing = False
+    w.tick_timer.start()
+    seen = []
+    t0 = time.time()
+    while time.time() - t0 < 5.2:
+        app.processEvents()
+        w._tick_scan_clock()
+        cur = w.scan_elapsed.text()
+        if not seen or seen[-1][1] != cur:
+            seen.append((round(time.time() - t0, 2), cur))
+        time.sleep(0.02)
+    w.tick_timer.stop()
+    nums = [int(t.split("|")[1].split("s")[0])
+            for _, t in seen if "s 后" in t]
+    check("倒计时从满值起步", nums and nums[0] == 5, str(nums))
+    # 末尾会钳位在 1 直到停止, 只看去重后的序列
+    uniq = []
+    for n in nums:
+        if not uniq or uniq[-1] != n:
+            uniq.append(n)
+    check("严格逐秒递减", uniq == [5, 4, 3, 2, 1], str(uniq))
+    check("1 秒后钳位不继续减", uniq[-1] == 1 and nums[-1] == 1, str(nums[-3:]))
+    gaps = [round(b[0] - a[0], 2) for a, b in zip(seen, seen[1:])
+            if "s 后" in b[1]]
+    check("每格停留 1 秒", all(0.9 <= g <= 1.2 for g in gaps), str(gaps))
+    check("变化次数等于秒数+1", len(seen) <= 7, str(len(seen)))
+    # 文本没变时不重绘(卡顿主因)
+    w._last_clock_text = "占位"
+    before = w.scan_elapsed.text()
+    w._last_clock_text = before
+    w._tick_scan_clock()
+    check("文本未变时不重绘", w._last_clock_text == before, w._last_clock_text)
+    w.scan_start_time = 0.0
+    w.scan_deadline = None
+    w._cd_anchor_left = 0
+    w._last_clock_text = ""
+    w.scan_elapsed.setText("")
+
+    # 旧配置迁移: 存了 0 的旧配置应升级为 45
+    import core.aircore as AC, json
+    old_cfg = {"scan_auto_stop": 0, "use_gpu": True}
+    AC.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AC.CONFIG_FILE.write_text(json.dumps(old_cfg))
+    ac = AC.AirCore()
+    check("旧配置 0 迁移为 45", ac.config["scan_auto_stop"] == 45,
+          str(ac.config["scan_auto_stop"]))
+    AC.CONFIG_FILE.write_text(json.dumps(
+        {"scan_auto_stop": 0, "scan_auto_stop_explicit": True}))
+    ac2 = AC.AirCore()
+    check("用户显式设 0 保留", ac2.config["scan_auto_stop"] == 0,
+          str(ac2.config["scan_auto_stop"]))
+    AC.CONFIG_FILE.unlink()
+
     section("关闭时清理线程")
     w2.close()
     pump(100)

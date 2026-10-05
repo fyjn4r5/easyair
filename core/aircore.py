@@ -65,8 +65,15 @@ class AirCore:
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE) as f:
-                    self.config.update(json.load(f))
-            except (json.JSONDecodeError, OSError):
+                    saved = json.load(f)
+                self.config.update(saved)
+                # 迁移: 早期默认是不自动停止(0), 配置文件里存了 0 会一直
+                # 覆盖新默认值 45, 导致用户永远看不到倒计时。只在"从没
+                # 主动设置过"的情况下补默认值, 用户自己设成 0 的尊重。
+                if not saved.get("scan_auto_stop_explicit") and \
+                        int(saved.get("scan_auto_stop", 0) or 0) == 0:
+                    self.config["scan_auto_stop"] = 45
+            except (json.JSONDecodeError, OSError, ValueError):
                 pass
 
     def save_config(self):

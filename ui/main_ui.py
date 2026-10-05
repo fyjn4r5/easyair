@@ -245,7 +245,7 @@ class CrackSettingsDialog(QDialog):
         self.scan_secs.setSingleStep(15)
         self.scan_secs.setSuffix(" 秒")
         self.scan_secs.setSpecialValueText("手动停止")
-        self.scan_secs.setValue(int(config.get("scan_auto_stop", 0) or 0))
+        self.scan_secs.setValue(int(config.get("scan_auto_stop", 45) or 45))
         form.addRow("扫描自动停止:", self.scan_secs)
 
         self.temp_limit = QSpinBox()
@@ -290,6 +290,8 @@ class CrackSettingsDialog(QDialog):
             "hashcat_extra_args": self.extra_args.text().strip(),
             "auto_monitor": self.auto_mon.isChecked(),
             "scan_auto_stop": self.scan_secs.value(),
+            # 标记用户主动设置过, 之后即使设为 0(不自动停止)也不再被迁移
+            "scan_auto_stop_explicit": True,
             "hashcat_temp_limit": self.temp_limit.value(),
         }
 
