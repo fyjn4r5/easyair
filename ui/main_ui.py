@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem, QAbstractItemView, QMenu, QAction, QInputDialog,
     QLineEdit, QSpinBox, QDialog, QDialogButtonBox, QFormLayout,
     QTabWidget, QProgressBar, QTreeWidget, QTreeWidgetItem, QFrame,
-    QSystemTrayIcon, QStyle
+    QSystemTrayIcon, QStyle, QApplication
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QSize
 from PyQt5.QtGui import QFont, QColor, QIcon, QPixmap, QPainter
