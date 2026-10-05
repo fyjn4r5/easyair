@@ -334,13 +334,16 @@ class MainUI(QWidget):
 
         tb_layout.addSpacing(10)
 
-        # 监听模式状态指示器 (带图标的按钮) - 关键：补回这个按钮
+        # 监听模式: 只保留状态指示, 开关统一由「设置」里的自动监听管理
+        # (之前顶部还有一个独立开关, 与设置项重复且容易状态不一致)
         self.btn_mon_toggle = QPushButton()
         self.btn_mon_toggle.setCheckable(True)
         self.btn_mon_toggle.setFixedSize(40, 40)
         self.btn_mon_toggle.setIcon(self.icon_off)
         self.btn_mon_toggle.setIconSize(QSize(24, 24))
-        self.btn_mon_toggle.setToolTip("监听模式: 关闭\n点击开启/关闭")
+        self.btn_mon_toggle.setEnabled(False)
+        self.btn_mon_toggle.setToolTip(
+            "监听模式由「设置」中的自动监听统一管理\n扫描或抓包时自动开启")
         self.btn_mon_toggle.setStyleSheet("""
             QPushButton {
                 border: 2px solid #ddd;
@@ -350,9 +353,6 @@ class MainUI(QWidget):
             QPushButton:checked {
                 border: 2px solid #2e7d32;
                 background: #e8f5e9;
-            }
-            QPushButton:hover {
-                background: #f5f5f5;
             }
         """)
         tb_layout.addWidget(self.btn_mon_toggle)
@@ -435,6 +435,8 @@ class MainUI(QWidget):
         self.ap_table.setColumnCount(7)
         self.ap_table.setHorizontalHeaderLabels(
             ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"])
+        # BSSID/信道/加密 明细对日常使用不是必需, 但抓包要用 BSSID,
+        # 因此保留列但收窄, 完整信息通过 tooltip 展示
         ap_header = self.ap_table.horizontalHeader()
         ap_header.setSectionResizeMode(QHeaderView.Interactive)
         ap_header.setStretchLastSection(False)
@@ -541,17 +543,17 @@ class MainUI(QWidget):
         status_line.setFixedHeight(26)
         st_layout = QHBoxLayout(status_line)
         st_layout.setContentsMargins(12, 0, 12, 0)
+        # 扫描时长与倒计时放在任务栏最左侧, 之后才是状态文字
+        self.scan_elapsed = QLabel("")
+        self.scan_elapsed.setStyleSheet("color: #607d8b;")
+        self.scan_elapsed.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.scan_elapsed.setMinimumWidth(230)
+        self.scan_elapsed.setToolTip("扫描时长与自动停止倒计时")
+        st_layout.addWidget(self.scan_elapsed)
         self.status_label = QLabel("就绪 · 点击「扫描」搜索周边 AP")
         self.status_label.setStyleSheet("color: #455a64;")
         st_layout.addWidget(self.status_label)
         st_layout.addStretch()
-        # 扫描时长与倒计时放在底部任务栏, 不占用顶部空间
-        self.scan_elapsed = QLabel("")
-        self.scan_elapsed.setStyleSheet("color: #607d8b;")
-        self.scan_elapsed.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.scan_elapsed.setMinimumWidth(230)
-        self.scan_elapsed.setToolTip("扫描时长与自动停止倒计时")
-        st_layout.addWidget(self.scan_elapsed)
         root.addWidget(status_line)
 
         self.setStyleSheet(self._app_stylesheet())

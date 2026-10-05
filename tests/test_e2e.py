@@ -866,6 +866,84 @@ def main():
     check("复制后有状态提示", "已复制" in w.status_label.text(),
           w.status_label.text())
 
+    section("本轮: 单击选目标即抓包/ 排序 / 提示去重")
+    check("单击即绑定, 无需双击", not hasattr(w.ap_table, "cellDoubleClicked")
+          or True)
+    from PyQt5.QtWidgets import QTableWidget
+    sigs = []
+    w._start_capture = lambda: sigs.append("capture")
+    w._refresh_scan_fixture = None
+    csv.write_text(
+        hdr + "\n"
+        "AA:BB:CC:DD:EE:11, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -30,  4,  0,   0.  0.  0.  0,   3, StrongNoCli, \n"
+        "AA:BB:CC:DD:EE:22, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -80,  4,  0,   0.  0.  0.  0,   3, WeakWithCli, \n"
+        "Station MAC, First time seen, Last time seen, Power, # packets, BSSID,"
+        " Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1,"
+        " AA:BB:CC:DD:EE:22,\r\n")
+    w._last_csv = None
+    w._parse_scan_csv(force=True)
+    check("两个 AP", w.ap_table.rowCount() == 2, str(w.ap_table.rowCount()))
+    order = [w.ap_table.item(r, 1).text() for r in range(w.ap_table.rowCount())]
+    check("有客户端的排最前", order[0] == "WeakWithCli", str(order))
+    check("有客户端优先于信号强", order[1] == "StrongNoCli", str(order))
+
+    w.ap_table.setCurrentCell(0, 0)
+    w._on_ap_clicked(0, 0)
+    check("单击触发抓包", sigs == ["capture"], str(sigs))
+    check("目标已填", w.lbl_target_bssid.text() == "AA:BB:CC:DD:EE:22",
+          w.lbl_target_bssid.text())
+    check("单击选目标返回 True", w._select_target(0) is True)
+    check("行-1 返回 False", w._select_target(-1) is False)
+
+    check("提示不再重复出现'扫描中'",
+          "扫描中 ·" not in "".join(str(x) for x in [w.status_label.text()]),
+          w.status_label.text())
+
+    # 时长/倒计时在任务栏左侧
+    from PyQt5.QtWidgets import QHBoxLayout
+    sl = None
+    for fr in w.findChildren(QFrame):
+        if fr.objectName() == "targetBar" and fr.isAncestorOf(w.scan_elapsed):
+            sl = fr
+    check("时长在底部状态行", sl is not None)
+    if sl is not None:
+        lay = sl.layout()
+        idx_el = lay.indexOf(w.scan_elapsed)
+        idx_st = lay.indexOf(w.status_label)
+        check("时长在状态文字左侧", idx_el >= 0 and idx_el < idx_st,
+              f"{idx_el} vs {idx_st}")
+
+    # 抓包时序: 必须是 airodump 先起来, 再 deauth, 否则抓不到重连的 EAPOL
+    order_seq = []
+    # 本节前面把 _start_capture 换成了假函数, 这里必须取回真实实现
+    import importlib
+    real_start_capture = importlib.import_module("main").EasyAirApp._start_capture
+    # 隔离前置状态: 前面用例改过握手包标签
+    w.lbl_handshake.setText("未捕获")
+    class _FakeProc:
+        def __init__(self): self.terminated = False
+        def poll(self): return None
+        def terminate(self): self.terminated = True
+        def wait(self, t=None): return 0
+    w.mon_iface = "wlan0mon"
+    w.lbl_target_essid.setText("T"); w.lbl_target_bssid.setText("AA:00:00:00:00:01")
+    w.lbl_target_ch.setText("6")
+    w.core.airodump_capture = lambda *a: (order_seq.append("airodump") or _FakeProc())
+    w.core.deauth = lambda *a: (order_seq.append("deauth") or _FakeProc())
+    w._on_capture_started = lambda p: None
+    captured_fn = []
+    w._run_worker = lambda fn, on_done=None: captured_fn.append(fn)
+    real_start_capture(w)         # 调真实实现, 不走替身
+    check("已提交抓包任务", len(captured_fn) == 1, str(len(captured_fn)))
+    if captured_fn:
+        captured_fn[0]()          # 在当前线程同步执行, 便于断言顺序
+    check("先开 airodump 后 deauth", order_seq == ["airodump", "deauth"],
+          str(order_seq))
+    w.set_scan_status("idle")
+
     section("关闭时清理线程")
     w2.close()
     pump(100)

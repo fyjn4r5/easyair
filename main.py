@@ -178,7 +178,7 @@ class EasyAirApp(MainUI):
         self.log_tabs.currentChanged.connect(lambda _i: None)
 
         # AP 表格双击选择目标
-        self.ap_table.cellDoubleClicked.connect(self._on_ap_double_clicked)
+        self.ap_table.cellClicked.connect(self._on_ap_clicked)
 
         # 握手包库双击载入
         self.cap_tree.itemDoubleClicked.connect(self._on_cap_double_clicked)
@@ -316,6 +316,61 @@ class EasyAirApp(MainUI):
             self.log("  - 虚拟机: 需将支持监听的 USB 无线网卡直通")
 
     # ===== 监听模式手动切换 =====
+    def _enable_monitor(self) -> bool:
+        """同步开启监听模式, 供"选中目标即抓包"这类流程内部调用。
+
+        走工作线程执行 start_monitor, 完成后直接在当前线程继续,
+        因此最多等待一次(界面在此期间不刷新)。返回是否成功开启。"""
+        physical = self.iface_combo.currentText().strip()
+        if not physical:
+            self.set_status("请先在顶部选择无线网卡")
+            return False
+        if self.mon_iface:
+            return True
+
+        self.set_monitor_status("starting")
+        self.physical_iface = physical
+        btn = self.btn_mon_toggle
+        was_checked = btn.isChecked()
+        btn.setChecked(True)          # 触发 _on_mon_toggle
+        btn.setChecked(was_checked)   # 还原: 开关已被禁用, 不代表用户意图
+        btn.setEnabled(False)
+
+        proc = None
+        try:
+            proc = self.core.start_monitor(physical)
+        except Exception as e:  # noqa: BLE001
+            print(f"[监听开启异常] {e}")
+        if not proc:
+            self.set_monitor_status("error")
+            btn.setEnabled(True)
+            self.set_status("监听模式开启失败")
+            return False
+
+        mon = self._detect_mon_iface(physical)
+        if not mon:
+            # 轮询等待接口出现
+            for _ in range(10):
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.3)
+                mon = self._detect_mon_iface(physical)
+                if mon:
+                    break
+        if not mon:
+            proc.terminate()
+            self.set_monitor_status("error")
+            btn.setEnabled(True)
+            self.set_status("监听模式开启失败")
+            return False
+
+        self.mon_iface = mon
+        self._monitor_proc = proc
+        self.set_monitor_status("on")
+        btn.setEnabled(False)
+        self.log(f"[监听] 已开启: {physical} → {mon}")
+        return True
+
     def _on_mon_toggle(self, checked: bool):
         physical = self.iface_combo.currentText()
         if not physical:
@@ -717,7 +772,7 @@ class EasyAirApp(MainUI):
 
         # 监听模式已就绪则直接扫, 不必重启监听(重启会打断已有会话)
         if self.mon_iface and self.core.check_monitor_mode(self.mon_iface):
-            self.set_status("扫描中 · 正在启动 airodump-ng")
+            self.set_status("正在启动 airodump-ng…")
             self._do_scan()
             return
 
@@ -782,7 +837,7 @@ class EasyAirApp(MainUI):
         t = self._spawn_cmd(proc, self.log_scan, self._on_scan_exited)
         if hasattr(t, "exited"):
             t.exited.connect(self._on_scan_exit_code)
-        self.set_status("扫描中 · 等待 AP…")
+        self.set_status("正在搜索周边 AP…")
 
     def _on_scan_exited(self):
         """airodump-ng 进程结束。若一个 AP 都没有, 说明是启动失败而非环境安静。"""
@@ -814,7 +869,7 @@ class EasyAirApp(MainUI):
         waited = int(time.time() - self.scan_start_time)
         iface = self.mon_iface or "(空)"
         self.log(f"[警告] 已扫描 {waited}s 仍未捕获到任何 AP")
-        self.set_status(f"扫描中 · {waited}s 未捕获 AP")
+        self.set_status(f"已等待 {waited}s，仍未捕获 AP")
 
         def _probe():
             return {
@@ -826,13 +881,13 @@ class EasyAirApp(MainUI):
                 "airodump": shutil.which("airodump-ng") or "",
             }
 
-        self.set_status("扫描中 · 正在检测监听状态…")
+        self.set_status("正在检测监听状态…")
         self._run_worker(_probe, self._apply_no_aps_diag)
 
     def _apply_no_aps_diag(self, d):
         if not d:
             self.log("  · 状态检测失败，请手动执行 airodump-ng 验证")
-            self.set_status("扫描中 · 仍未捕获 AP")
+            self.set_status("仍未捕获 AP，请查看日志建议")
             return
 
         if not d["airodump"]:
@@ -845,7 +900,7 @@ class EasyAirApp(MainUI):
             self.log("  · 无 root 提权手段，airodump-ng 可能抓不到数据")
         self.log(f"  · 当前可用无线接口: {', '.join(d['ifaces']) or '无'}")
         self.log("  · 建议: 靠近 2.4GHz 热点后重试，或点顶部 ● 关闭再开启监听模式")
-        self.set_status("扫描中 · 仍未捕获 AP，请查看日志建议")
+        self.set_status("仍未捕获 AP，请查看日志建议")
 
     def _scan_elapsed_text(self):
         if not self.scan_start_time:
@@ -951,7 +1006,7 @@ class EasyAirApp(MainUI):
                 tip = f", {n_cli} 个有客户端" if n_cli else ""
                 n_hid = getattr(self, "_hidden_ssids", 0)
                 htip = f" · 已隐藏 {n_hid} 个隐藏SSID" if n_hid else ""
-                self.set_status(f"发现 {len(rows)} 个 AP{tip}{htip} - 双击选择目标")
+                self.set_status(f"发现 {len(rows)} 个 AP{tip}{htip} - 点击选择目标")
         except (OSError, UnicodeDecodeError, ValueError, IndexError) as e:
             self.log(f"[解析失败] {e}")
 
@@ -1092,7 +1147,10 @@ class EasyAirApp(MainUI):
                          client_count))
             self._client_tips[bssid.upper()] = client_tip
         # 信号强的排前面(未知信号沉底)
-        rows.sort(key=lambda r: (r[0] is None, -(r[0] if r[0] is not None else 0)))
+        # 排序: 有客户端的排最前, 同组内信号强的排前, 未知信号沉底。
+        # 优先展示"有人且信号好"的 AP, 这才是值得抓的目标。
+        rows.sort(key=lambda r: (r[7] == 0, r[0] is None,
+                                 -(r[0] if r[0] is not None else 0)))
         self._hidden_ssids = hidden_count
         return rows
 
@@ -1111,12 +1169,19 @@ class EasyAirApp(MainUI):
             return "██░░░", "#ef6c00"
         return "█░░░░", "#c62828"
 
-    def _on_ap_double_clicked(self, row, col):
-        self._select_target(row)
+    def _on_ap_clicked(self, row, col):
+        """单击即设为目标, 并立即开始抓握手包 —— 不再需要双击/再点按钮。"""
+        if not self._select_target(row):
+            return
+        # 已有握手包则不重复抓, 避免误触就长时间占用网卡
+        if self.lbl_handshake.text() not in ("未捕获", ""):
+            self.set_status("该目标已有握手包，如需重抓请先停止当前抓包")
+            return
+        self._start_capture()
 
     def _select_target(self, row):
         if row < 0:
-            return
+            return False
         def _get(col):
             it = self.ap_table.item(row, col)
             return it.text() if it else ""
@@ -1134,7 +1199,8 @@ class EasyAirApp(MainUI):
         self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
         
         self.log(f"[目标] 已选择: {essid} ({bssid}) CH:{ch}")
-        self.set_status(f"目标已锁定: {essid} - 点击'抓取握手包'")
+        self.set_status(f"目标已锁定: {essid}")
+        return True
 
     # ===== 抓包 =====
     def _toggle_scan(self):
@@ -1156,29 +1222,36 @@ class EasyAirApp(MainUI):
         bssid = self.lbl_target_bssid.text()
         ch = self.lbl_target_ch.text()
         if essid == "未选择" or not bssid:
-            QMessageBox.warning(self, "提示", "请先在左侧列表双击选择目标 AP")
+            QMessageBox.warning(self, "提示", "请先在左侧列表点击选择目标 AP")
             return
 
         if not self.mon_iface:
-            QMessageBox.warning(self, "提示", "监听模式未就绪")
-            return
+            # 监听没开就自动开, 不再要求用户先去顶部点一次
+            self.log("[抓包] 监听模式未开启, 正在自动开启…")
+            if not self._enable_monitor():
+                QMessageBox.warning(self, "提示", "监听模式开启失败，请先开启监听模式")
+                return
 
         self.log(f"[抓包] 目标: {essid} | {bssid} | CH{ch}")
         self.bottom_tabs.setCurrentWidget(self.log_scan_box)
         self.set_status("正在抓取握手包…")
 
-        # deauth 是抓握手包的必要前置: 客户端不会主动重连, 必须先把它踢下线。
-        # 以前要单独点一个按钮, 现在抓包时自动发送。
+        # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
+        # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL,
+        # 结果就是抓到的 cap 里没有握手包 —— 导入 eWSA 显示"无数据"。
         def _capture():
-            deauth_note = None
-            if self.mon_iface:
-                dp = self.core.deauth(self.mon_iface, bssid, 10)
-                if dp:
-                    self.log(f"[deauth] 已自动发送 10 次解关联 → {bssid}")
-                    time.sleep(1.5)  # 等客户端开始重连
-                else:
-                    deauth_note = "deauth 发送失败，可能抓不到握手包"
-            return self.core.airodump_capture(self.mon_iface, bssid, ch, "handshake")
+            proc = self.core.airodump_capture(
+                self.mon_iface, bssid, ch, "handshake")
+            if not proc:
+                return None
+            # 等 airodump 完成握手再发 deauth
+            time.sleep(2.0)
+            dp = self.core.deauth(self.mon_iface, bssid, 10)
+            if dp:
+                self.log(f"[deauth] 已自动发送 10 次解关联 → {bssid}")
+            else:
+                self.log("[deauth] 发送失败, 可能抓不到握手包")
+            return proc
 
         self._run_worker(_capture, self._on_capture_started)
 
