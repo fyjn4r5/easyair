@@ -110,6 +110,52 @@ def main():
     w.log("[测试] 有意义的信息应当保留")
     check("有意义日志正常输出",
           "[测试] 有意义的信息应当保留" in w.log_scan_box.toPlainText())
+    for err in ("airodump-ng: command not found",
+                "airmon-ng: permission denied",
+                "Operation not permitted",
+                "Error - cannot read /dev/..."):
+        w.log(err)
+    txt = w.log_scan_box.toPlainText()
+    for err in ("command not found", "permission denied",
+                "Operation not permitted", "cannot read"):
+        check(f"真实报错可见: {err}", err in txt)
+
+    section("扫描失败可恢复")
+    w3 = M.EasyAirApp()
+    w3.mon_iface = "wlan0mon"
+    w3.btn_scan.setEnabled(True)
+    w3.btn_stop_scan.setEnabled(False)
+    w3.core.airodump_scan = lambda *a, **k: subprocess.Popen(
+        ["sh", "-c", "sleep 30"], stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1)
+    w3._do_scan()
+    pump(150)                      # 等 _on_scan_started 完成, 避免竞态
+    w3._scan_failed("模拟: airodump-ng 启动失败")
+    pump(120)
+    check("失败后计时器已停", not w3.scan_timer.isActive())
+    check("失败后扫描按钮可点", w3.btn_scan.isEnabled())
+    check("失败后停止按钮禁用", not w3.btn_stop_scan.isEnabled())
+    check("失败后按钮文案复位", w3.btn_scan.text() == "🔍 扫描", w3.btn_scan.text())
+    check("失败原因写入状态行", "扫描失败" in w3.status_label.text(),
+          w3.status_label.text())
+    check("失败原因写入日志", "模拟: airodump-ng 启动失败" in w3.log_scan_box.toPlainText())
+    check("失败时保留监听接口", w3.mon_iface == "wlan0mon", str(w3.mon_iface))
+
+    section("扫描前置自检")
+    check("缺 airodump-ng 时不启动扫描",
+          w3._preflight_scan() in (True, False))
+    w3.core.can_elevate = lambda: False
+    orig_which = M.shutil.which
+    M.shutil.which = lambda n: None
+    try:
+        ok = w3._preflight_scan()
+    finally:
+        M.shutil.which = orig_which
+    check("缺依赖时自检拦截", ok is False)
+    check("自检提示缺 airodump-ng",
+          "airodump-ng" in w3.log_scan_box.toPlainText())
+    w3.core.can_elevate = lambda: True
+    w3.close()
 
     section("布局: 列宽可拖动")
     from PyQt5.QtWidgets import QHeaderView

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import shutil
 import subprocess
 import shlex
 import time
@@ -369,6 +370,14 @@ class AirCore:
         
         self.log(f"[监听模式] 开启失败，输出: {output_lines}")
         return False, ""
+
+    def can_elevate(self) -> bool:
+        """能否取得 root 权限: 已是 root / 有缓存密码 / 有 pkexec"""
+        if os.geteuid() == 0:
+            return True
+        if self._get_sudo_password():
+            return True
+        return bool(shutil.which("pkexec"))
 
     def airodump_scan(self, mon_iface: str, outfile_prefix: str = "scan"):
         outpath = self.caps_dir / outfile_prefix

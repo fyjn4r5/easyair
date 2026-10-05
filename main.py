@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import sys
+import os
 import re
 import time
+import shutil
 import subprocess
 import csv as csvmod
 from pathlib import Path
@@ -17,11 +19,13 @@ from core.aircore import AirCore, today_str
 class CmdThread(QThread):
     line_out = pyqtSignal(str)
     done = pyqtSignal()
+    exited = pyqtSignal(int)
 
     def __init__(self, proc):
         super().__init__()
         self.proc = proc
         self._stop = False
+        self.returncode = -1
 
     def run(self):
         try:
@@ -32,9 +36,11 @@ class CmdThread(QThread):
                     break
                 self.line_out.emit(line.rstrip())
             self.proc.wait()
+            self.returncode = self.proc.returncode
         except (OSError, ValueError) as e:
             print(f"[CmdThread] {e}")
         finally:
+            self.exited.emit(self.returncode)
             self.done.emit()
 
     def stop(self):
@@ -83,6 +89,7 @@ class EasyAirApp(MainUI):
         self.scan_start_time = time.time()
         self.scan_deadline = None
         self._stopping_scan = False
+        self.scan_returncode = None
 
         # 破解相关状态
         self.current_crack_item = None
@@ -209,6 +216,14 @@ class EasyAirApp(MainUI):
         self._workers.clear()
 
     # ===== 日志 =====
+    # 真实报错关键词: 命中即绕过噪音过滤, 保证用户能看到失败原因
+    _ERROR_KEYWORDS = (
+        "not found", "no such file", "permission denied",
+        "operation not permitted", "cannot ", "can't ", "failed",
+        "error", "unable", "请以 root", "must be root", "denied",
+        "unsupported", "not supported", "no devices found",
+    )
+
     # 原始工具输出过滤规则: iw/airmon-ng 的表格、"command failed" 噪音
     _NOISE_PATTERNS = (
         "command failed", "command time out", "no such device",
@@ -219,7 +234,10 @@ class EasyAirApp(MainUI):
     )
 
     def _should_log(self, txt: str) -> bool:
-        """只保留有信息量的行, 过滤 iw/airmon-ng 原始输出"""
+        """过滤 iw/airmon-ng 原始输出, 但真实报错必须放行。
+        顺序: 先按已知噪音表丢弃(这些是 iw 的固定输出, 如
+        'command failed: No such device'), 未命中噪音表的报错行
+        (如 'permission denied' / 'not found')一律保留。"""
         s = txt.strip()
         if not s:
             return False
@@ -227,7 +245,10 @@ class EasyAirApp(MainUI):
         for pat in self._NOISE_PATTERNS:
             if pat.lower() in low:
                 return False
-        # 纯表格行(连续制表符) 与 重复的 --- 分隔线
+        for key in self._ERROR_KEYWORDS:
+            if key in low:
+                return True
+        # 纯表格行(连续制表符)
         if s.count("\t") >= 2:
             return False
         return True
@@ -489,20 +510,44 @@ class EasyAirApp(MainUI):
         self.set_status(f"已载入握手包 {Path(cap).name} - 可开始破解")
 
     # ===== 扫描 AP（自动开启监听）=====
+    def _preflight_scan(self) -> bool:
+        """开扫前自检, 避免启动后一直停在'等待 AP'却不知原因。
+        注意 airodump-ng 由 core 内部用 sudo/pkexec 提权运行,
+        所以不要求 GUI 本身是 root, 只要求有提权手段。"""
+        problems = []
+        if not shutil.which("airodump-ng"):
+            problems.append("未安装 airodump-ng（sudo apt install aircrack-ng）")
+        if not self.core.can_elevate():
+            problems.append("无法取得 root 权限（无密码文件且未安装 pkexec）")
+        if problems:
+            for p in problems:
+                self.log(f"[自检] {p}")
+            self.set_status("扫描前置检查未通过")
+            return False
+        return True
+
     def _start_scan(self):
         physical = self.iface_combo.currentText()
         if not physical:
-            QMessageBox.warning(self, "提示", "请先选择无线网卡")
+            self.set_status("请先在顶部选择无线网卡")
             return
 
-        self.set_status("正在开启监听模式并扫描...")
-        self.log(f"[自动] 开启监听模式: {physical}")
+        if not self._preflight_scan():
+            return
+
+        # 监听模式已就绪则直接扫, 不必重启监听(重启会打断已有会话)
+        if self.mon_iface and self.core.check_monitor_mode(self.mon_iface):
+            self.set_status("扫描中 · 正在启动 airodump-ng")
+            self._do_scan()
+            return
+
+        self.set_status("正在开启监听模式…")
         self.set_monitor_status("starting")
-        
+
         self.physical_iface = physical
         self.btn_scan.setEnabled(False)
         self.btn_stop_scan.setEnabled(True)
-        self.btn_scan.setText("⏳ 开启监听中...")
+        self.btn_scan.setText("⏳ 开启监听中…")
 
         self._run_worker(lambda: self.core.start_monitor(physical),
                          self._on_mon_ready_for_scan)
@@ -510,20 +555,28 @@ class EasyAirApp(MainUI):
     def _on_mon_ready_for_scan(self):
         """监听模式就绪，开始扫描"""
         physical = self.physical_iface
-        mon = self._detect_mon_iface(physical)
 
+        def _detect():
+            return self._detect_mon_iface(physical)
+
+        self._run_worker(_detect, self._apply_mon_then_scan)
+
+    def _apply_mon_then_scan(self, mon):
         if mon:
             self.mon_iface = mon
-            self.log(f"[就绪] 监听接口: {mon}")
+            self.log(f"监听模式已就绪 · 接口 {mon}")
             self.set_monitor_status("on")
             self._do_scan()
             return
 
-        self.log("[错误] 监听模式开启失败：未检测到 monitor 接口")
+        self.log("监听模式开启失败 · 未检测到 monitor 接口")
+        self.log("  · 该网卡驱动可能不支持监听模式")
+        self.log("  · 虚拟机需直通支持监听的 USB 无线网卡")
         self.set_monitor_status("error")
         self.btn_scan.setEnabled(True)
         self.btn_stop_scan.setEnabled(False)
-        self.set_status("监听模式开启失败")
+        self.btn_scan.setText("🔍 扫描")
+        self.set_status("监听模式开启失败 · 无法扫描")
 
     def _do_scan(self):
         """实际开始 airodump-ng 扫描"""
@@ -543,8 +596,39 @@ class EasyAirApp(MainUI):
         self.set_scan_status("scanning")
 
     def _on_scan_started(self, proc):
-        self.scan_thread = self._spawn_cmd(proc, self.log)
+        if not proc:
+            self.log("[错误] airodump-ng 启动失败")
+            self._scan_failed("airodump-ng 无法启动 · 请检查是否已安装")
+            return
+        t = self._spawn_cmd(proc, self.log_scan, self._on_scan_exited)
+        if hasattr(t, "exited"):
+            t.exited.connect(self._on_scan_exit_code)
         self.set_status("扫描中 · 等待 AP…")
+
+    def _on_scan_exited(self):
+        """airodump-ng 进程结束。若一个 AP 都没有, 说明是启动失败而非环境安静。"""
+        if not self.scan_timer.isActive():
+            return  # 用户主动停止
+        if self.ap_table.rowCount() > 0:
+            return
+        self._scan_failed("airodump-ng 已退出但未捕获到任何 AP")
+
+    def _on_scan_exit_code(self, rc: int):
+        self.scan_returncode = rc
+
+    def _scan_failed(self, reason: str):
+        """扫描失败: 说明原因并恢复界面, 不要再停在'等待 AP'"""
+        self.log(f"[错误] {reason}")
+        self._stop_scan()          # 先恢复界面, 它会覆写 status
+        hints = []
+        if not shutil.which("airodump-ng"):
+            hints.append("未找到 airodump-ng，请先安装 aircrack-ng 套件")
+        if not self.mon_iface:
+            hints.append("监听接口为空，请先开启监听模式")
+        hints.append("确认以 root 运行，且网卡驱动支持监听模式")
+        for h in hints:
+            self.log(f"  · {h}")
+        self.set_status(f"扫描失败 · {reason}")
 
     def _scan_elapsed_text(self):
         base = f"扫描时长: {self._format_elapsed(self.scan_start_time)}"
