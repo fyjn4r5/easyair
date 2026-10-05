@@ -105,7 +105,41 @@ class AirCore:
         except Exception:
             return False
 
+    def _run_sudo(self, args: List[str]) -> subprocess.CompletedProcess:
+        """同步执行 sudo 命令，用于清理等非交互操作"""
+        pwd = self._get_sudo_password()
+        if pwd and not self._password_verified:
+            if self._verify_sudo_password(pwd):
+                self._password_verified = True
+                self.log(f"[sudo] 密码验证通过")
+            else:
+                self.log(f"[sudo] 密码验证失败")
+                pwd = None
+        
+        if pwd:
+            full_cmd = ["sudo", "-S", "-p", ""] + args
+            return subprocess.run(
+                full_cmd,
+                input=pwd + "\n",
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding='utf-8',
+                errors='replace'
+            )
+        else:
+            full_cmd = ["pkexec"] + args
+            return subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                encoding='utf-8',
+                errors='replace'
+            )
+
     def _run_sudo_cmd(self, cmd: str) -> subprocess.Popen:
+        """异步执行 sudo 命令，用于长时间运行的进程"""
         pwd = self._get_sudo_password()
         
         if pwd and not self._password_verified:
@@ -161,7 +195,7 @@ class AirCore:
             return []
 
     def get_monitor_interface(self, iface: str) -> Optional[str]:
-        """获取对应的监听模式接口名（可能同名）"""
+        """获取对应的监听模式接口名"""
         try:
             res = subprocess.run(["iw", "dev"], capture_output=True, text=True, encoding='utf-8', errors='replace')
             for line in res.stdout.splitlines():
@@ -172,7 +206,7 @@ class AirCore:
                             return p
         except Exception:
             pass
-        return None  # 不再假设一定是 iface+mon
+        return None
 
     def check_monitor_mode(self, iface: str) -> bool:
         """检查接口是否已在监听模式"""
@@ -183,33 +217,37 @@ class AirCore:
             return False
 
     def _cleanup_monitor(self, iface: str):
-        """清理可能残留的监听接口"""
+        """清理可能残留的监听接口 - 使用同步 sudo"""
+        self.log(f"[清理] 检查残留监听接口: {iface}")
+        
+        # 先尝试停止可能的 mon 接口
         mon = self.get_monitor_interface(iface)
         if mon and mon != iface:
-            try:
-                subprocess.run(["sudo", "airmon-ng", "stop", mon], capture_output=True, timeout=5)
-            except Exception:
-                pass
-        try:
-            subprocess.run(["sudo", "airmon-ng", "stop", iface], capture_output=True, timeout=5)
-        except Exception:
-            pass
+            self.log(f"[清理] 停止残留 mon 接口: {mon}")
+            self._run_sudo(["airmon-ng", "stop", mon])
+        
+        # 再尝试停止物理接口（如果它变成了 monitor 模式）
+        if self.check_monitor_mode(iface):
+            self.log(f"[清理] 停止物理接口 monitor 模式: {iface}")
+            self._run_sudo(["airmon-ng", "stop", iface])
+        
+        time.sleep(0.5)
 
     def start_monitor(self, iface: str):
         """开启监听模式"""
         self.log(f"[监听模式] 准备开启: {iface}")
         
-        # 1. 先清理残留
+        # 1. 先清理残留（同步）
         self._cleanup_monitor(iface)
-        time.sleep(0.5)
         
-        # 2. 检查是否已经在监听模式
+        # 2. 再次检查是否已经在监听模式（清理后）
         if self.check_monitor_mode(iface):
-            self.log(f"[监听模式] {iface} 已经是 Monitor 模式")
+            self.log(f"[监听模式] {iface} 清理后仍是 Monitor 模式，直接使用")
             return subprocess.Popen(["echo", "already_monitor"], stdout=subprocess.PIPE, text=True)
         
         # 3. 杀掉干扰进程
-        self._run_sudo_cmd("airmon-ng check kill").wait()
+        self.log(f"[监听模式] 杀掉干扰进程...")
+        self._run_sudo(["airmon-ng", "check", "kill"])
         
         # 4. 启动监听模式
         self.log(f"[监听模式] 执行: airmon-ng start {iface}")
@@ -225,13 +263,14 @@ class AirCore:
     def ensure_monitor(self, iface: str) -> Tuple[bool, str]:
         """确保接口在监听模式，返回(成功, 监听接口名)"""
         self._password_verified = False
+        self.log(f"[监听模式] 确保 {iface} 进入监听模式...")
         
         # 先清理
         self._cleanup_monitor(iface)
-        time.sleep(0.3)
         
         # 检查物理接口是否已是监听模式
         if self.check_monitor_mode(iface):
+            self.log(f"[监听模式] {iface} 已经是 Monitor 模式，直接使用")
             return True, iface
         
         # 启动
@@ -248,7 +287,7 @@ class AirCore:
             time.sleep(0.1)
         p.wait()
         
-        # 关键：先检查原接口是否变成了 monitor 模式（rtl8723be 等驱动不改名）
+        # 关键：先检查原接口是否变成了 monitor 模式
         if self.check_monitor_mode(iface):
             self.log(f"[监听模式] 成功: {iface} (原接口直接切换)")
             return True, iface
