@@ -363,10 +363,14 @@ class EasyAirApp(MainUI):
 
         mon = self._detect_mon_iface(physical)
         if not mon:
-            # 轮询等待接口出现
+            # 轮询等待接口出现。这段原本是 time.sleep(0.3) x 10 跑在
+            # UI 主线程上, 最长把界面冻住 3 秒(而且 _detect_mon_iface
+            # 还会同步跑 iw/ip 命令)。改成让出事件循环: UI 仍可重绘
+            # 和响应点击, 总等待时间不变。
             for _ in range(10):
                 if proc.poll() is not None:
                     break
+                QApplication.processEvents()
                 time.sleep(0.3)
                 mon = self._detect_mon_iface(physical)
                 if mon:
