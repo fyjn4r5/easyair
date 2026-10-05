@@ -1,5 +1,5 @@
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QGroupBox,
     QSplitter, QFileDialog, QMessageBox, QCheckBox, QListWidget,
     QListWidgetItem, QAbstractItemView, QMenu, QAction, QInputDialog,
@@ -189,7 +189,6 @@ class MainUI(QWidget):
         root.setSpacing(6)
         root.setContentsMargins(8, 8, 8, 8)
 
-        # ===== 顶部工具栏 =====
         toolbar = QFrame()
         toolbar.setFrameShape(QFrame.StyledPanel)
         toolbar.setMaximumHeight(50)
@@ -206,7 +205,6 @@ class MainUI(QWidget):
 
         tb_layout.addSpacing(10)
 
-        # 监听模式状态指示器 (带图标的按钮) - 关键：补回这个按钮
         self.btn_mon_toggle = QPushButton()
         self.btn_mon_toggle.setCheckable(True)
         self.btn_mon_toggle.setFixedSize(40, 40)
@@ -257,10 +255,8 @@ class MainUI(QWidget):
 
         root.addWidget(toolbar)
 
-        # ===== 主分割区 =====
         main_splitter = QSplitter(Qt.Horizontal)
 
-        # ---- 左侧: AP 列表 + 扫描/抓包控制 ----
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setSpacing(6)
@@ -322,7 +318,6 @@ class MainUI(QWidget):
 
         main_splitter.addWidget(left_widget)
 
-        # ---- 右侧: 破解面板 (EWSA 风格) ----
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setSpacing(6)
@@ -379,7 +374,6 @@ class MainUI(QWidget):
 
         root.addWidget(main_splitter, 1)
 
-        # ===== 底部日志 =====
         log_group = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_group)
         self.log_box = QTextEdit()
