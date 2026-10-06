@@ -1403,10 +1403,13 @@ def main():
     w2 = M.EasyAirApp()
     w2.mon_iface = None
     w2._preflight_scan = lambda: True
+    w2.iface_combo.currentText = lambda: "wlan0"
     w2.core.check_monitor_mode = lambda i: False
     w2.core.start_monitor = lambda i: subprocess.Popen(["sleep", "30"])
     w2._start_scan()
     app.processEvents()
+    check("入口未被网卡缺失短路",
+          "无线网卡" not in w2.scan_elapsed.text(), w2.scan_elapsed.text())
     check("按下扫描立刻起表", bool(w2.scan_start_time), str(w2.scan_start_time))
     check("立刻显示倒计时", "45s" in w2.scan_elapsed.text(), w2.scan_elapsed.text())
     w2._disarm_scan_clock()
@@ -1417,6 +1420,7 @@ def main():
     w3 = M.EasyAirApp()
     w3.mon_iface = None
     w3._preflight_scan = lambda: True
+    w3.iface_combo.currentText = lambda: "wlan0"
     w3.core.check_monitor_mode = lambda i: False
     w3.core._get_sudo_password = lambda: "definitely-wrong"
     w3.core._verify_sudo_password = lambda p: False
