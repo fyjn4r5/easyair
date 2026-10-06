@@ -407,13 +407,6 @@ class MainUI(QWidget):
 
         tgt_layout.addStretch()
 
-        self.lbl_engine = QLabel("Hashcat · GPU+CPU")
-        self.lbl_engine.setStyleSheet("color: #1565c0; font-weight: bold;")
-        tgt_layout.addWidget(self.lbl_engine)
-        self.btn_change_engine = QPushButton("更改")
-        self.btn_change_engine.setFixedSize(56, 24)
-        tgt_layout.addWidget(self.btn_change_engine)
-
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -442,14 +435,13 @@ class MainUI(QWidget):
 
         self.ap_table = QTableWidget()
         self.ap_table.setColumnCount(7)
-        # 客户端列按原宽 92 的 1/4 = 23px。实测 23px 放不下"客户端"表头
-        # (需 42px)也放不下"N 台"(需 33px), 因此表头缩写为"端"、内容只显示
-        # 数字, 完整信息(客户端数与 MAC 列表)放在 tooltip 里。
+        # 客户端列 56px: 表头"客户端"需 42px、内容"N 台"需 33px, 都放得下,
+        # 无需再缩写。完整信息(客户端数与 MAC 列表)放在 tooltip 里。
         # BSSID 列宽按当前字体实测, 保证 AA:BB:CC:DD:EE:FF 完整显示:
         # 不同字体的 MAC 宽度差别很大(Ubuntu 字体约 122px, DejaVu Sans
         # 12pt 约 166px), 写死像素换台机器就被截断, 因此这里按字体算。
         self.ap_table.setHorizontalHeaderLabels(
-            ["信号", "SSID", "端", "BSSID", "信道", "加密", "强度"])
+            ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"])
         # BSSID/信道/加密 明细对日常使用不是必需, 但抓包要用 BSSID,
         # 因此保留列但收窄, 完整信息通过 tooltip 展示
         ap_header = self.ap_table.horizontalHeader()
@@ -457,8 +449,8 @@ class MainUI(QWidget):
         ap_header.setStretchLastSection(False)
         ap_header.setHighlightSections(False)
         # 关键: QHeaderView.minimumSectionSize 默认被字体撑到 57px,
-        # 任何小于它的 setColumnWidth 都会被悄悄抬回 57 —— 这就是"端"列
-        # 无论如何都缩不下去的原因。这里显式降到 12px 才能真正收窄。
+        # 任何小于它的 setColumnWidth 都会被悄悄抬回 57 —— 之前"客户端"列
+        # 怎么调都收不下去就是这个原因。这里显式降到 12px 才能真正生效。
         ap_header.setMinimumSectionSize(12)
         self._apply_ap_column_widths()
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -572,6 +564,13 @@ class MainUI(QWidget):
         self.status_label.setStyleSheet("color: #455a64;")
         st_layout.addWidget(self.status_label)
         st_layout.addStretch()
+        # 当前用的破解引擎只在右下角任务栏显示一次。之前它挤在顶部目标栏,
+        # 还带一个"更改"按钮, 占地方又和顶部的设置入口重复。
+        self.lbl_engine = QLabel("Hashcat · GPU+CPU")
+        self.lbl_engine.setStyleSheet("color: #1565c0; font-weight: bold;")
+        self.lbl_engine.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_engine.setToolTip("当前破解引擎 · 点右上角「⚙ 设置」切换")
+        st_layout.addWidget(self.lbl_engine)
         root.addWidget(status_line)
 
         self.setStyleSheet(self._app_stylesheet())
@@ -778,15 +777,15 @@ class MainUI(QWidget):
         列宽不能写死像素, 也不能只在 __init__ 里算一次: 样式表应用后字体
         会变(本机 MAC 需 122px, CI 容器需 166px), 构造期量到的值到运行期
         就不够了, 结果 BSSID 被截断。因此每次显示前重算。
-        信号/端/信道/加密/强度 固定, 余下在 SSID 与 BSSID 之间分配, 两者
+        信号/客户端/信道/加密/强度 固定, 余下在 SSID 与 BSSID 之间分配, 两者
         之和恒定, 保证总宽不因字体差异而改变。
         """
-        fixed = 44 + 23 + 44 + 88 + 52
+        fixed = 44 + 56 + 44 + 88 + 52
         need = QFontMetrics(self.ap_table.font()).horizontalAdvance(
             "AA:BB:CC:DD:EE:FF") + 10
         bssid = max(need, 60)
         ssid = max(90, 602 - fixed - bssid)
-        self._AP_WIDTHS = [44, ssid, 23, bssid, 44, 88, 52]
+        self._AP_WIDTHS = [44, ssid, 56, bssid, 44, 88, 52]
         for idx, w in enumerate(self._AP_WIDTHS):
             self.ap_table.setColumnWidth(idx, w)
 

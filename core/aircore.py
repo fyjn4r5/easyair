@@ -28,6 +28,35 @@ CONFIG_FILE = _data_dir() / "config" / "settings.json"
 HISTORY_FILE = _data_dir() / "config" / "history.json"
 PAS_FILE = Path.home() / ".Pas"
 
+# airodump-ng --background 能力探测结果: None=未探测, True/False=结论。
+# 加载旧版 aircrack-ng 时没有该选项, 直接传会退出, 所以只在确认支持后才加。
+_BG_SUPPORT: dict = {}
+
+
+def supports_background() -> bool:
+    if "ok" not in _BG_SUPPORT:
+        ok = False
+        exe = shutil.which("airodump-ng")
+        if exe:
+            try:
+                r = subprocess.run([exe, "--help"], capture_output=True,
+                                   encoding="utf-8", errors="replace", timeout=5)
+                ok = "--background" in (r.stdout or "") + (r.stderr or "")
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                ok = False
+        _BG_SUPPORT["ok"] = ok
+    return _BG_SUPPORT["ok"]
+
+
+def background_arg() -> str:
+    """airodump-ng 默认全速重绘屏幕。
+
+    stdout 接管道(非 tty)时它不做任何节流, 实测 12MB/s、约 22 万行/秒的
+    ANSI 全屏重绘。每一行都变成一个 Qt 信号 → 事件队列和内存一起爆炸,
+    结果就是倒计时走不动、界面冻结、整机卡死。`--background 1` 跳过重绘
+    (实测 3 秒只输出 2 行), CSV 照常写入。"""
+    return " --background 1" if supports_background() else ""
+
 import datetime
 
 
@@ -431,8 +460,38 @@ class AirCore:
 
     def airodump_scan(self, mon_iface: str, outfile_prefix: str = "scan"):
         outpath = self.caps_dir / outfile_prefix
-        cmd = f"airodump-ng {mon_iface} --write-interval 1 --output-format csv -w {outpath}"
+        cmd = (f"airodump-ng {mon_iface} --write-interval 1 "
+               f"--output-format csv{background_arg()} -w {outpath}")
         return self.run_cmd(cmd, sudo=True)
+
+    @staticmethod
+    def supports_background_probe() -> bool:
+        """预热 `--background` 能力缓存, 避免第一次扫描时同步探测阻塞。"""
+        return supports_background()
+
+    def kill_scan_processes(self) -> bool:
+        """杀掉遗留的扫描 airodump-ng，返回是否确实发出了终止信号。
+
+        停止按钮漏杀、上一次异常退出都会留下 airodump 进程: 它们持续写
+        CSV 并全速刷 stdout，每多一个界面就更卡一分 —— 这正是"越用越卡"。
+        只匹配 `-w <captures>/scan`，不会误杀抓包/破解进程；锚定行首的
+        `airodump-ng` 也保证不会误伤承载本次 pkill 的 sudo 自身。"""
+        if not shutil.which("pkill"):
+            return False
+        if os.geteuid() == 0:
+            pat = f"^airodump-ng.*-w {re.escape(str(self.caps_dir))}/scan"
+            try:
+                return subprocess.run(["pkill", "-f", pat],
+                                      capture_output=True, timeout=10).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if not self._get_sudo_password():
+            return False
+        pat = f"^airodump-ng.*-w {re.escape(str(self.caps_dir))}/scan"
+        try:
+            return self._run_sudo(["pkill", "-f", pat]).returncode == 0
+        except (PermissionError, OSError, subprocess.TimeoutExpired):
+            return False
 
     def cap_meta(self, cap: Path) -> dict:
         """读取抓包时记录的 AP 信息(ESSID/BSSID/信道)。
@@ -511,7 +570,8 @@ class AirCore:
         if not outfile_prefix:
             outfile_prefix = self.safe_cap_prefix(essid, bssid)
         outpath = self._dated_dir() / outfile_prefix
-        cmd = f"airodump-ng --bssid {bssid} --channel {ch} --output-format pcap,csv -w {outpath} {mon_iface}"
+        cmd = (f"airodump-ng --bssid {bssid} --channel {ch} "
+               f"--output-format pcap,csv{background_arg()} -w {outpath} {mon_iface}")
         return self.run_cmd(cmd, sudo=True)
 
     def deauth(self, mon_iface: str, bssid: str, count: int = 10):

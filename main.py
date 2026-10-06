@@ -14,7 +14,7 @@ from typing import Optional
 from PyQt5.QtWidgets import (QApplication, QMessageBox, QTableWidgetItem,
                              QFileDialog, QInputDialog, QTreeWidgetItem,
                              QMenu)
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, QEventLoop, Qt
 from PyQt5.QtGui import QFont, QColor
 
 from ui.main_ui import MainUI, WordListDialog, CrackSettingsDialog, CrackResultWidget
@@ -29,6 +29,16 @@ class CmdThread(QThread):
     done = pyqtSignal()
     exited = pyqtSignal(int)
 
+    # 每秒最多往 GUI 送多少行: 超出的丢弃并在下一秒补一条汇总。
+    # airodump-ng 在 stdout 非终端时会以约 22 万行/秒刷全屏(实测 12MB/s),
+    # 若每行都发一个信号, 事件队列和内存会一起爆炸 —— 这就是"一扫描就卡死、
+    # 15 秒倒计时只走 1 秒"的根因。
+    MAX_LINES_PER_SEC = 60
+
+    # 全屏重绘的特征序列。正常报错行里不会出现, 一旦命中就认为该进程之后
+    # 的输出全是画面内容, 整块丢弃(代价接近零), 只需继续读以免管道背压。
+    _DRAW_MARKERS = (b"\x1b[2J", b"\x1b[0K", b"\x1b[?25l", b"\x1b[2;1H")
+
     def __init__(self, proc):
         super().__init__()
         self.proc = proc
@@ -39,10 +49,7 @@ class CmdThread(QThread):
         try:
             if not self.proc or not self.proc.stdout:
                 return
-            for line in self.proc.stdout:
-                if self._stop:
-                    break
-                self.line_out.emit(line.rstrip())
+            self._pump(self.proc.stdout)
             self.proc.wait()
             self.returncode = self.proc.returncode
         except (OSError, ValueError) as e:
@@ -50,6 +57,75 @@ class CmdThread(QThread):
         finally:
             self.exited.emit(self.returncode)
             self.done.emit()
+
+    def _pump(self, stream):
+        """按字节读取子进程输出, 只把"人看得懂的行"限流后交给 GUI。
+
+        直接 `for line in stream` 会经过 TextIOWrapper 的行缓冲, 整屏 ANSI
+        重绘仍会变成几十万个信号; 这里绕开文本层自己分块, 顺带识别并丢弃
+        重绘输出, 再做每秒限流。"""
+        raw = getattr(stream, "buffer", None)
+        if raw is None and hasattr(stream, "read1"):
+            raw = stream  # 测试桩/无文本层的原始流
+        read_chunk = getattr(raw, "read1", None) if raw is not None else None
+        if read_chunk is None:
+            # 无字节层或只有 read(n)(会一直等到读满为止): 退化为按行读
+            for line in stream:
+                if self._stop:
+                    break
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", "replace")
+                self._send(line.rstrip("\r\n"))
+            return
+
+        pending = b""
+        drawing = False
+        state = {"t": time.monotonic(), "sent": 0, "dropped": 0}
+
+        def tick(force=False):
+            """每秒结算一次限流窗口, 有被丢掉的行就补一条汇总说明。"""
+            now = time.monotonic()
+            if force or now - state["t"] >= 1.0:
+                if state["dropped"]:
+                    self._send(f"[输出] 已过滤 {state['dropped']} 行界面刷新噪音")
+                state["t"] = now
+                state["sent"] = 0
+                state["dropped"] = 0
+
+        def push(line: bytes):
+            if state["sent"] >= CmdThread.MAX_LINES_PER_SEC:
+                state["dropped"] += 1
+                return
+            state["sent"] += 1
+            self._send(line.decode("utf-8", "replace").rstrip("\r"))
+
+        while not self._stop:
+            tick()
+            try:
+                chunk = read_chunk(65536)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            if drawing:
+                continue
+            if any(m in chunk for m in self._DRAW_MARKERS):
+                drawing = True
+                continue
+            pending += chunk
+            if b"\n" in pending:
+                parts = pending.split(b"\n")
+                pending = parts.pop()
+                for line in parts:
+                    if self._stop:
+                        return
+                    tick()
+                    push(line)
+        tick(force=True)
+
+    def _send(self, text: str):
+        if text:
+            self.line_out.emit(text)
 
     def stop(self):
         self._stop = True
@@ -89,6 +165,8 @@ class EasyAirApp(MainUI):
         self.mon_iface = None
         self.physical_iface = None
         self._last_csv = None
+        # 上一次写入表格的行数据: 内容没变就不重建表格
+        self._last_rows = None
         self.auto_monitor_enabled = self.core.config.get("auto_monitor", True)
         self.scan_auto_stop = int(self.core.config.get("scan_auto_stop", 0) or 0)
 
@@ -134,6 +212,12 @@ class EasyAirApp(MainUI):
         self._refresh_engine_label()
         self._load_history_tabs()
         self._refresh_cap_tree()
+
+        # 后台清掉上次异常退出遗留的扫描进程, 顺带探测 airodump 的
+        # --background 支持(一次, 之后都是缓存结果)
+        threading.Thread(target=self._cleanup_stale_scans, daemon=True).start()
+        threading.Thread(target=self.core.supports_background_probe,
+                         daemon=True).start()
 
     def closeEvent(self, event):
         """退出必须快速返回。
@@ -182,7 +266,6 @@ class EasyAirApp(MainUI):
 
         # 破解设置
         self.btn_crack_cfg.clicked.connect(self._open_crack_settings)
-        self.btn_change_engine.clicked.connect(self._open_crack_settings)
 
         # 破解控制
         self.btn_start_crack.clicked.connect(self._toggle_crack)
@@ -369,45 +452,75 @@ class EasyAirApp(MainUI):
         btn.blockSignals(False)
         btn.setEnabled(False)
 
-        proc = None
-        try:
-            proc = self.core.start_monitor(physical)
-        except PermissionError as e:
-            self.set_monitor_status("error")
+        # start_monitor(airmon-ng + 多次 sudo)与 _detect_mon_iface 都是
+        # 阻塞子进程, 最长十几秒。之前直接在 GUI 线程跑, 表现为"选中目标
+        # 即抓包"时界面整个冻住。这里放进工作线程, 用嵌套事件循环等结果:
+        # 对外仍是同步返回 bool(调用方语义不变), 而这段时间界面照常重绘、
+        # 倒计时照常走。
+        err = {"kind": "", "msg": ""}
+
+        def _work():
+            try:
+                p = self.core.start_monitor(physical)
+            except PermissionError as e:
+                err.update(kind="perm", msg=str(e))
+                return None
+            except Exception as e:  # noqa: BLE001
+                err.update(kind="exc", msg=str(e))
+                return None
+            if not p:
+                err.update(kind="none", msg="")
+                return None
+
+            mon = self._detect_mon_iface(physical)
+            if not mon:
+                # 轮询等待接口出现(airmon-ng 建好接口需要一点时间)
+                for _ in range(10):
+                    if p.poll() is not None:
+                        break
+                    time.sleep(0.3)
+                    mon = self._detect_mon_iface(physical)
+                    if mon:
+                        break
+            if not mon:
+                p.terminate()
+                err.update(kind="nomon", msg="")
+                return None
+            return p, mon
+
+        out = {"v": None}
+        loop = QEventLoop()
+        worker = FuncThread(_work)
+
+        def _done(v):
+            out["v"] = v
+            if loop.isRunning():
+                loop.quit()
+
+        worker.done.connect(_done)
+        self._workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._workers.discard(w))
+        self._track(worker)
+        # 先让事件循环跑起来再启动线程, 否则极快返回时 quit() 会落空
+        QTimer.singleShot(0, worker.start)
+        QTimer.singleShot(20000, loop.quit)  # 驱动卡死时也不永久挂起
+        loop.exec_()
+        worker.wait(300)
+
+        if out["v"] is None:
             btn.setEnabled(True)
-            self.set_status("无 root 权限，无法开启监听")
-            self.log(f"[监听开启失败] {e}")
-            return False
-        except Exception as e:  # noqa: BLE001
-            self.log(f"[监听开启异常] {e}")
-            proc = None
-        if not proc:
             self.set_monitor_status("error")
-            btn.setEnabled(True)
-            self.set_status("监听模式开启失败")
+            if err["kind"] == "perm":
+                self.set_status("无 root 权限，无法开启监听")
+                self.log(f"[监听开启失败] {err['msg']}")
+            elif err["kind"] == "exc":
+                self.log(f"[监听开启异常] {err['msg']}")
+                self.set_status("监听模式开启失败")
+            else:
+                self.set_status("监听模式开启失败")
             return False
 
-        mon = self._detect_mon_iface(physical)
-        if not mon:
-            # 轮询等待接口出现。这段原本是 time.sleep(0.3) x 10 跑在
-            # UI 主线程上, 最长把界面冻住 3 秒(而且 _detect_mon_iface
-            # 还会同步跑 iw/ip 命令)。改成让出事件循环: UI 仍可重绘
-            # 和响应点击, 总等待时间不变。
-            for _ in range(10):
-                if proc.poll() is not None:
-                    break
-                QApplication.processEvents()
-                time.sleep(0.3)
-                mon = self._detect_mon_iface(physical)
-                if mon:
-                    break
-        if not mon:
-            proc.terminate()
-            self.set_monitor_status("error")
-            btn.setEnabled(True)
-            self.set_status("监听模式开启失败")
-            return False
-
+        proc, mon = out["v"]
         self.mon_iface = mon
         self._monitor_proc = proc
         self.set_monitor_status("on")
@@ -879,18 +992,37 @@ class EasyAirApp(MainUI):
         # 先起表, 再开监听: 等待监听的每一秒都算进扫描时间, 界面也
         # 立刻给出反馈, 不会出现"按了没反应"
         self._arm_scan_clock()
+        self.physical_iface = physical
+        # 先同步禁用按钮: 之前的实现把这一步放到异步回调里, 点击到"响应"
+        # 之间按钮还是亮着的, 用户连点会叠起多次检查。这里先置灰,
+        # 等监听准备就绪后再由 _do_scan / 失败分支恢复。
+        self.btn_scan.setEnabled(False)
+        self.btn_scan.setText("⏳ 检查监听中…")
 
-        # 监听模式已就绪则直接扫, 不必重启监听(重启会打断已有会话)
-        if self.mon_iface and self.core.check_monitor_mode(self.mon_iface):
+        # 监听模式已就绪则直接扫, 不必重启监听(重启会打断已有会话)。
+        # check_monitor_mode 要连跑 iwconfig/iw 两个子进程(各 5s 超时),
+        # 之前放在 GUI 线程 —— 网卡驱动卡住时按钮之后的界面全部冻结,
+        # 表现为"倒计时看着只走了 1 秒"。这里必须在工作线程里做。
+        self.set_status("正在检查监听模式…")
+        self._run_worker(self._probe_monitor_ready, self._on_monitor_probe)
+
+    def _probe_monitor_ready(self):
+        """工作线程: 返回已就绪的监听接口, 未就绪返回 None。"""
+        mon = self.mon_iface
+        if mon and self.core.check_monitor_mode(mon):
+            return mon
+        return None
+
+    def _on_monitor_probe(self, mon):
+        if mon:
             self.set_status("正在启动 airodump-ng…")
             self._do_scan()
             return
 
+        physical = self.physical_iface
         self.set_status("正在开启监听模式…")
         self.set_monitor_status("starting")
 
-        self.physical_iface = physical
-        self.btn_scan.setEnabled(False)
         self.btn_scan.setText("⏳ 开启监听中…")
 
         def _start_mon():
@@ -989,9 +1121,31 @@ class EasyAirApp(MainUI):
             self._scan_failed("airodump-ng 无法启动 · 请检查是否已安装")
             return
         t = self._spawn_cmd(proc, self.log_scan, self._on_scan_exited)
+        # 必须记住这个线程: 之前 scan_thread 一直停留在初始值 None,
+        # _stop_scan 根本杀不掉 airodump —— 每停一次就多留一个进程,
+        # 累积起来就是"越用越卡、越来越严重"。
+        self.scan_thread = t
+        t.finished.connect(lambda th=t: self._forget_scan_thread(th))
         if hasattr(t, "exited"):
             t.exited.connect(self._on_scan_exit_code)
         self.set_status("正在搜索周边 AP…")
+
+    def _forget_scan_thread(self, th):
+        if self.scan_thread is th:
+            self.scan_thread = None
+
+    def _cleanup_stale_scans(self):
+        """启动时清掉上次崩溃/异常退出遗留的 airodump 扫描进程。
+
+        它们在后台持续刷输出、占 CPU, 用户看不到却一直在拖慢界面。
+        放在守护线程里跑, 不阻塞窗口显示。注意必须用独立 AirCore 实例:
+        校验一次真实密码会把 _password_verified 置真, 污染主实例后,
+        密码失效的降级路径(报错而非继续尝试)就再也不会触发了。"""
+        try:
+            if AirCore().kill_scan_processes():
+                print("[启动清理] 已结束上次遗留的 airodump 扫描进程")
+        except Exception as e:  # noqa: BLE001
+            print(f"[启动清理] {e}")
 
     def _on_scan_exited(self):
         """airodump-ng 进程结束。若一个 AP 都没有, 说明是启动失败而非环境安静。"""
@@ -1076,9 +1230,13 @@ class EasyAirApp(MainUI):
             return
         self._stopping_scan = True
         try:
-            if self.scan_thread:
+            had_thread = self.scan_thread is not None
+            if had_thread:
                 self.scan_thread.stop()
                 self.scan_thread = None
+                # terminate() 只保证杀掉 sudo 这层, 真正的 airodump 可能还活着;
+                # 再按命令行补一次兜底清理, 否则残余进程会一直刷输出。
+                self._run_worker(self.core.kill_scan_processes, None)
             self.scan_timer.stop()
             self.tick_timer.stop()
             self.scan_deadline = None
@@ -1142,6 +1300,13 @@ class EasyAirApp(MainUI):
             stations_by_bssid = self._parse_station_section(station_sec)
             rows = self._parse_ap_csv(ap_sec, stations_by_bssid)
             if rows:
+                # 内容没变就不重建: 扫描中每 1.5s 全量重建上千个
+                # QTableWidgetItem 是界面发闷的另一来源。force(停止扫描、
+                # 用户刷新)时必须重画 —— 表格可能已被别处清空。
+                key = tuple(rows)
+                if not force and key == self._last_rows:
+                    return
+                self._last_rows = key
                 # setUpdatesEnabled(False) 必须配 finally 恢复, 否则刷新
                 # 表格过程中一旦抛异常, 表格会永久停止重绘 —— 表现就是
                 # 界面卡住甚至随窗口关闭而崩溃。
@@ -1753,7 +1918,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.12.5"
+VERSION = "1.13.0"
 
 
 def _selftest() -> int:

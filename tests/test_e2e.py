@@ -75,6 +75,11 @@ def main():
     check("引擎摘要非空", len(w.lbl_engine.text()) > 0, w.lbl_engine.text())
     check("引擎下拉框已从主面板移除", not hasattr(w, "crack_engine"))
     check("设备下拉框已从主面板移除", not hasattr(w, "device_combo"))
+    check("更改按钮已移除", not hasattr(w, "btn_change_engine"))
+    check("引擎摘要移到底部任务栏",
+          getattr(w.lbl_engine.parent(), "objectName", lambda: "")() == "targetBar"
+          and w.lbl_engine.parent() is w.status_label.parent(),
+          str(w.lbl_engine.parent()))
 
     section("布局: 底部标签页")
     check("底部有 3 个 tab", w.bottom_tabs.count() == 3, str(w.bottom_tabs.count()))
@@ -97,6 +102,11 @@ def main():
           str(w.lbl_target_essid.height()))
     check("进度条在顶部状态条", w.progress_bar.y() < w.ap_table.y(),
           f"progress_y={w.progress_bar.y()} ap_y={w.ap_table.y()}")
+    check("任务栏右侧为引擎摘要",
+          w.lbl_engine.y() < w.ap_table.y()
+          and w.status_label.x() < w.lbl_engine.x(),
+          f"eng_y={w.lbl_engine.y()} ap_y={w.ap_table.y()} "
+          f"status_x={w.status_label.x()} eng_x={w.lbl_engine.x()}")
 
     section("布局: 日志噪音过滤")
     noise = [
@@ -499,6 +509,44 @@ def main():
           str(w2.log_scan_box.blockCount()))
     check("AP 表行数正确", w2.ap_table.rowCount() == 30, str(w2.ap_table.rowCount()))
 
+    section("线程: 扫描线程被记住(进程泄漏回归)")
+    # 回归: scan_thread 从未被赋值, _stop_scan 杀不掉 airodump,
+    # 每停一次就多留一个进程 —— "越用越卡"的直接来源。
+    w2.scan_thread = None
+    _fake_proc = subprocess.Popen(["sh", "-c", "echo x; sleep 0.05"],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True, bufsize=1)
+    w2._on_scan_started(_fake_proc)
+    check("scan_thread 已被记住", w2.scan_thread is not None)
+    pump(300)
+    check("线程结束后引用自动归还", w2.scan_thread is None,
+          str(w2.scan_thread))
+
+    section("线程: CmdThread 丢弃整屏重绘(卡死回归)")
+    got1 = []
+    _p1 = subprocess.Popen(
+        ["sh", "-c",
+         "printf '\\033[2J\\033[2;1H'; sleep 0.05; "
+         "for i in $(seq 1 3000); do echo d$i; done"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    t1 = w2._spawn_cmd(_p1, lambda s: got1.append(s))
+    _deadline = time.time() + 5
+    while t1.isRunning() and time.time() < _deadline:
+        pump(20)
+    check("整屏重绘一行都不进 GUI", not got1, str(got1[:3]))
+
+    section("线程: CmdThread 刷行限流(卡死回归)")
+    got2 = []
+    _p2 = subprocess.Popen(
+        ["sh", "-c", "for i in $(seq 1 4000); do echo flood-$i; done"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    t2 = w2._spawn_cmd(_p2, lambda s: got2.append(s))
+    _deadline = time.time() + 5
+    while t2.isRunning() and time.time() < _deadline:
+        pump(20)
+    check("限流后有行通过且不超上限", 0 < len(got2) <= 250, str(len(got2)))
+    check("超出部分有汇总提示", any("已过滤" in s for s in got2), str(got2[-3:]))
+
     section("扫描停止行为")
     stopped = {"n": 0}
     w2.core.stop_monitor = lambda m: (stopped.__setitem__("n", stopped["n"] + 1),
@@ -639,8 +687,8 @@ def main():
     check("AP 表为 7 列", w.ap_table.columnCount() == 7, str(w.ap_table.columnCount()))
     col_hdr = [w.ap_table.horizontalHeaderItem(i).text()
                for i in range(w.ap_table.columnCount())]
-    # 列宽 23px 放不下"客户端"(需42px), 表头缩写为"端"
-    check("客户端列紧跟 SSID(表头缩写 端)", col_hdr[2] == "端", str(col_hdr))
+    # 客户端列 56px: 表头"客户端"与内容"N 台"都放得下, 不再缩写
+    check("客户端列紧跟 SSID", col_hdr[2] == "客户端", str(col_hdr))
     check("列宽合计不超过左栏",
           sum(w.ap_table.columnWidth(i) for i in range(7)) <= 660,
           str(sum(w.ap_table.columnWidth(i) for i in range(7))))
@@ -662,7 +710,7 @@ def main():
     w._parse_scan_csv(force=True)
     cells = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).text()
              for r in range(w.ap_table.rowCount())}
-    # 23px 列放不下"N 台", 只显示数字, 详情在 tooltip
+    # 客户端列内容只显示数字, 完整的"N 台"与 MAC 列表在 tooltip
     check("有客户端的 AP 显示数量", cells.get("WithCli", "") == "2", str(cells))
     check("无客户端显示短横", cells.get("NoCli", "") == "-", str(cells))
     tipmap = {w.ap_table.item(r, 1).text(): w.ap_table.item(r, 2).toolTip()
@@ -1249,7 +1297,7 @@ def main():
     t = w.ap_table
     fm = _FM(t.font())
     widths = [t.columnWidth(i) for i in range(7)]
-    check("客户端列为原宽 92 的 1/4", widths[2] == 23, str(widths[2]))
+    check("客户端列 56px 放得下表头与内容", widths[2] == 56, str(widths[2]))
     _mac_px = fm.horizontalAdvance("AA:BB:CC:DD:EE:FF")
     # 列宽按字体实测分配, 不能写死像素: Ubuntu 字体一个 MAC 约 122px,
     # DejaVu Sans 12pt 约 166px, 换字体写死 130 就会截断 BSSID。
@@ -1259,21 +1307,21 @@ def main():
     check("BSSID 不浪费多余宽度", widths[3] <= _mac_px + 12,
           f"{widths[3]} <= {_mac_px + 12}")
     check("SSID 拿到省下的宽度", widths[1] >= 90, str(widths[1]))
-    check("端列表头缩写放得下",
-          widths[2] >= fm.horizontalAdvance("端"),
-          f"{widths[2]} >= {fm.horizontalAdvance('端')}")
+    check("客户端列表头放得下",
+          widths[2] >= fm.horizontalAdvance("客户端"),
+          f"{widths[2]} >= {fm.horizontalAdvance('客户端')}")
     check("信号列放得下表头", widths[0] >= fm.horizontalAdvance("信号"))
     # 注意: 前面有测试把信号列改成 77(模拟用户拖动), 因此这里不能用
     # 602 这个绝对值; 只校验本次关心的两列宽度, 且总宽不应超出左栏上限。
     check("总宽不超左栏上限", sum(widths) <= 660, str(sum(widths)))
-    # 表头下限必须调低, 否则 setColumnWidth(23) 会被抬回 57
+    # 表头下限必须调低, 否则 setColumnWidth(56) 会被抬回 57
     check("表头最小列宽已调低",
           t.horizontalHeader().minimumSectionSize() <= 23,
           str(t.horizontalHeader().minimumSectionSize()))
     check("表头文案", [t.horizontalHeaderItem(i).text() for i in range(7)]
-          == ["信号", "SSID", "端", "BSSID", "信道", "加密", "强度"],
+          == ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"],
           str([t.horizontalHeaderItem(i).text() for i in range(7)]))
-    # 端列内容为纯数字, 详情在 tooltip
+    # 客户端列内容为纯数字, 详情在 tooltip
     _cd3 = w.core.caps_dir
     _cd3.mkdir(parents=True, exist_ok=True)
     _h = ("BSSID,First time seen,Last time seen,channel,Speed,Signal,"
@@ -1297,8 +1345,8 @@ def main():
           f"{t.rowCount()} 行 / {t.item(0, 1).text() if t.rowCount() else '-'}")
     check("MAC 完整 17 字符", len(t.item(0, 3).text()) == 17,
           t.item(0, 3).text())
-    check("端列为纯数字", t.item(0, 2).text().isdigit(), t.item(0, 2).text())
-    check("端列 tooltip 含客户端数与 MAC",
+    check("客户端列为纯数字", t.item(0, 2).text().isdigit(), t.item(0, 2).text())
+    check("客户端列 tooltip 含客户端数与 MAC",
           "3 台" in t.item(0, 2).toolTip()
           and "0E:BE:B2:FD:94:88" in t.item(0, 2).toolTip(),
           t.item(0, 2).toolTip())
