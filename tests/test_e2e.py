@@ -1402,6 +1402,7 @@ def main():
     # _do_scan() 要等 start_monitor, 表现为"按下没反应"。
     w2 = M.EasyAirApp()
     w2.mon_iface = None
+    w2._preflight_scan = lambda: True
     w2.core.check_monitor_mode = lambda i: False
     w2.core.start_monitor = lambda i: subprocess.Popen(["sleep", "30"])
     w2._start_scan()
@@ -1415,6 +1416,7 @@ def main():
     # 回归: 密码错误时一次开监听会连弹好几个 pkexec 模态框, 系统级阻塞
     w3 = M.EasyAirApp()
     w3.mon_iface = None
+    w3._preflight_scan = lambda: True
     w3.core.check_monitor_mode = lambda i: False
     w3.core._get_sudo_password = lambda: "definitely-wrong"
     w3.core._verify_sudo_password = lambda p: False
@@ -1433,6 +1435,9 @@ def main():
                 break
     finally:
         subprocess.Popen = _real_popen
+    _log = w3.log_scan_box.toPlainText()
+    check("确实走到了提权失败分支(日志有据)",
+          "密码验证失败" in _log or "权限" in _log, _log[-160:])
     check("未弹出任何 pkexec 进程", not _seen, str(_seen[:2]))
     check("失败后按钮复位", w3.btn_scan.isEnabled(), w3.btn_scan.text())
     check("失败后倒计时复位", w3.scan_start_time == 0)
