@@ -187,6 +187,7 @@ class EasyAirApp(MainUI):
         self._refreshing_caps = False
         self._stopping_scan = False
         self._crack_running = False
+        self._capture_running = False
         self._scan_warned = False
         self.scan_returncode = None
 
@@ -259,7 +260,7 @@ class EasyAirApp(MainUI):
 
         # 扫描/抓包
         self.btn_scan.clicked.connect(self._toggle_scan)
-        self.btn_capture.clicked.connect(self._start_capture)
+        self.btn_capture.clicked.connect(self._toggle_capture)
 
         # 字典管理
         self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
@@ -278,8 +279,9 @@ class EasyAirApp(MainUI):
         self.btn_del_record.clicked.connect(self._delete_record)
         self.log_tabs.currentChanged.connect(lambda _i: None)
 
-        # AP 表格双击选择目标
+        # AP 表格单击/双击选择目标并可开始抓包
         self.ap_table.cellClicked.connect(self._on_ap_clicked)
+        self.ap_table.cellDoubleClicked.connect(self._on_ap_double_clicked)
 
         # 握手包库双击载入
         self.cap_tree.itemDoubleClicked.connect(self._on_cap_double_clicked)
@@ -1332,18 +1334,21 @@ class EasyAirApp(MainUI):
         """把解析好的 AP 行写入表格(调用方负责 setUpdatesEnabled)。"""
         self.ap_table.setRowCount(len(rows))
         for i, r in enumerate(rows):
-            # r = (信号数值, SSID, 客户端, BSSID, 信道, 加密, 强度, 客户端数)
+            # r = (信号数值, SSID, 客户端, 强度, BSSID, 信道, 加密, 客户端数)
             pwr_int = r[0]
             cli_count = r[7]
+            bssid = r[4]
             for col, val in ((1, r[1]), (2, r[2]), (3, r[3]),
-                             (4, r[4]), (5, r[5]), (6, r[6])):
+                             (4, bssid), (5, r[5]), (6, r[6])):
                 it = QTableWidgetItem(val)
-                if col in (1, 3):
+                if col in (1, 4):
                     it.setToolTip(val)
                 if col == 2:
                     it.setForeground(QColor("#1565c0") if cli_count
                                     else QColor("#b0bec5"))
-                    it.setToolTip(self._client_tips.get(r[3], val))
+                    it.setToolTip(self._client_tips.get(bssid, val))
+                if col == 3:
+                    it.setToolTip(val if val else "")
                 self.ap_table.setItem(i, col, it)
             bar, color = self._signal_bar(pwr_int)
             it = QTableWidgetItem(bar)
@@ -1482,10 +1487,10 @@ class EasyAirApp(MainUI):
                 client_str = "-"
                 client_tip = "无在线客户端"
 
-            # 元组顺序 = 表格列序: 信号(数值), SSID, 客户端, BSSID, 信道,
-            # 加密, 认证, 强度, 客户端数
-            rows.append((pwr_int, essid, client_str, bssid.upper(), ch,
-                         enc_col, f"{pwr} dBm" if pwr else "",
+            # 元组顺序 = 表格列序: 信号(数值), SSID, 客户端, 强度, BSSID, 信道,
+            # 加密, 客户端数
+            rows.append((pwr_int, essid, client_str, f"{pwr} dBm" if pwr else "",
+                         bssid.upper(), ch, enc_col,
                          client_count))
             self._client_tips[bssid.upper()] = client_tip
         # 信号强的排前面(未知信号沉底)
@@ -1512,14 +1517,15 @@ class EasyAirApp(MainUI):
         return "█░░░░", "#c62828"
 
     def _on_ap_clicked(self, row, col):
-        """单击即设为目标, 并立即开始抓握手包 —— 不再需要双击/再点按钮。"""
+        """单击设为目标。"""
         if not self._select_target(row):
             return
-        # 已有握手包则不重复抓, 避免误触就长时间占用网卡
-        if self.lbl_handshake.text() not in ("未捕获", ""):
-            self.set_status("该目标已有握手包，如需重抓请先停止当前抓包")
-            return
-        self._start_capture()
+        self._toggle_capture()
+
+    def _on_ap_double_clicked(self, row, col):
+        """双击设为目标并开始/停止抓包。"""
+        self._select_target(row)
+        self._toggle_capture()
 
     def _select_target(self, row):
         if row < 0:
@@ -1527,11 +1533,11 @@ class EasyAirApp(MainUI):
         def _get(col):
             it = self.ap_table.item(row, col)
             return it.text() if it else ""
-        # 列序: 0信号 1SSID 2客户端 3BSSID 4信道 5加密 6强度
+        # 列序: 0信号 1SSID 2客户端 3强度 4BSSID 5信道 6加密
         essid = _get(1)
-        bssid = _get(3)
-        ch = _get(4)
-        enc = _get(5)
+        bssid = _get(4)
+        ch = _get(5)
+        enc = _get(6)
         
         self.lbl_target_essid.setText(essid)
         self.lbl_target_bssid.setText(bssid)
@@ -1558,6 +1564,13 @@ class EasyAirApp(MainUI):
             self._stop_crack()
         else:
             self._start_crack()
+
+    def _toggle_capture(self):
+        """开始抓包/停止抓包合并为一个按钮。"""
+        if getattr(self, "_capture_running", False):
+            self._stop_capture()
+        else:
+            self._start_capture()
 
     def _start_capture(self):
         essid = self.lbl_target_essid.text()
@@ -1608,6 +1621,10 @@ class EasyAirApp(MainUI):
                 self.log("[deauth] 发送失败, 可能抓不到握手包")
             return proc
 
+        self._capture_running = True
+        if hasattr(self, 'btn_capture'):
+            self.btn_capture.setText("⏸ 停止抓包")
+            self.btn_capture.setStyleSheet("font-weight: bold; background: #c62828; color: white;")
         self._run_worker(_capture, self._on_capture_started)
 
         self.cap_check_timer = QTimer(self)
@@ -1617,6 +1634,10 @@ class EasyAirApp(MainUI):
 
     def _on_capture_started(self, p):
         if not p:
+            self._capture_running = False
+            if hasattr(self, 'btn_capture'):
+                self.btn_capture.setText("📡 抓握手包")
+                self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
             self.set_status("抓包启动失败")
             return
         self.cap_thread = self._spawn_cmd(p, self.log_scan)
@@ -1641,7 +1662,33 @@ class EasyAirApp(MainUI):
             self._refresh_cap_tree()
             self.set_status(f"握手包已捕获 · 可开始破解")
             if hasattr(self, 'cap_check_timer'):
+                try:
+                    self.cap_check_timer.stop()
+                except Exception:
+                    pass
+            self._capture_running = False
+            if hasattr(self, 'btn_capture'):
+                self.btn_capture.setText("📡 抓握手包")
+                self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+
+    def _stop_capture(self):
+        self._capture_running = False
+        if hasattr(self, 'cap_check_timer') and self.cap_check_timer.isActive():
+            try:
                 self.cap_check_timer.stop()
+            except Exception:
+                pass
+        if getattr(self, 'cap_thread', None):
+            try:
+                self.cap_thread.stop()
+            except Exception:
+                pass
+            self.cap_thread = None
+        if hasattr(self, 'btn_capture'):
+            self.btn_capture.setText("📡 抓握手包")
+            self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+        self.set_status("已停止抓包")
+        self.log("[抓包] 已停止抓包")
 
     def _auto_stop_monitor(self):
         if self.auto_monitor_enabled and self.mon_iface:

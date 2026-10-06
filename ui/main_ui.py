@@ -441,7 +441,7 @@ class MainUI(QWidget):
         # 不同字体的 MAC 宽度差别很大(Ubuntu 字体约 122px, DejaVu Sans
         # 12pt 约 166px), 写死像素换台机器就被截断, 因此这里按字体算。
         self.ap_table.setHorizontalHeaderLabels(
-            ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"])
+            ["信号", "SSID", "客户端", "强度", "BSSID", "信道", "加密"])
         # BSSID/信道/加密 明细对日常使用不是必需, 但抓包要用 BSSID,
         # 因此保留列但收窄, 完整信息通过 tooltip 展示
         ap_header = self.ap_table.horizontalHeader()
@@ -483,8 +483,8 @@ class MainUI(QWidget):
         self.btn_scan.setToolTip("点击开始扫描 AP；扫描中点击可随时停止（不关闭监听）")
         self.btn_capture = QPushButton("📡 抓握手包")
         self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
-        self.btn_capture.setToolTip("自动对目标 AP 发送 deauth 促使客户端重连，并抓取握手包")
-        for b in (self.btn_scan, self.btn_capture):
+        self.btn_capture.setToolTip("自动对目标 AP 发送 deauth 促使客户端重连，并抓取握手包（双击AP表格也可开始/停止）")
+        for b in (self.btn_scan,):
             b.setMinimumHeight(32)
             ctrl_layout.addWidget(b)
         ap_group_layout.addLayout(ctrl_layout)
@@ -780,12 +780,12 @@ class MainUI(QWidget):
         信号/客户端/信道/加密/强度 固定, 余下在 SSID 与 BSSID 之间分配, 两者
         之和恒定, 保证总宽不因字体差异而改变。
         """
-        fixed = 44 + 56 + 44 + 88 + 52
+        fixed = 44 + 70 + 60 + 44 + 88 + 52  # 信号+客户端+强度+信道+加密+留余
         need = QFontMetrics(self.ap_table.font()).horizontalAdvance(
             "AA:BB:CC:DD:EE:FF") + 10
-        bssid = max(need, 60)
-        ssid = max(90, 602 - fixed - bssid)
-        self._AP_WIDTHS = [44, ssid, 56, bssid, 44, 88, 52]
+        bssid = max(need, 75)
+        ssid = max(100, 602 - fixed - bssid)
+        self._AP_WIDTHS = [44, ssid, 70, 60, bssid, 44, 88]
         for idx, w in enumerate(self._AP_WIDTHS):
             self.ap_table.setColumnWidth(idx, w)
 

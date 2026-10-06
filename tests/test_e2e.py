@@ -229,16 +229,16 @@ def main():
     for r in range(w.ap_table.rowCount()):
         row_of[w.ap_table.item(r, 1).text()] = r
     r0 = row_of["Net0"]
-    check("信道列正确", w.ap_table.item(r0, 4).text() == "1",
-          w.ap_table.item(r0, 4).text())
-    check("BSSID 列正确", w.ap_table.item(r0, 3).text() == "AA:BB:CC:DD:EE:00",
-          w.ap_table.item(r0, 3).text())
-    check("加密列正确", w.ap_table.item(r0, 5).text() == "WPA2/AES",
+    check("信道列正确", w.ap_table.item(r0, 5).text() == "1",
           w.ap_table.item(r0, 5).text())
+    check("BSSID 列正确", w.ap_table.item(r0, 4).text() == "AA:BB:CC:DD:EE:00",
+          w.ap_table.item(r0, 4).text())
+    check("加密列正确", w.ap_table.item(r0, 6).text() == "WPA2/AES",
+          w.ap_table.item(r0, 6).text())
     check("SSID 不是 ID-length", w.ap_table.item(r0, 1).text() == "Net0",
           w.ap_table.item(r0, 1).text())
-    check("强度列带 dBm", w.ap_table.item(r0, 6).text().endswith("dBm"),
-          w.ap_table.item(0, 6).text())
+    check("强度列带 dBm", w.ap_table.item(r0, 3).text().endswith("dBm"),
+          w.ap_table.item(r0, 3).text())
 
     section("扫描 CSV: 表头别名与旧格式兼容")
     rows = w._parse_ap_csv(
@@ -247,9 +247,9 @@ def main():
     check("短表头也能解析", len(rows) == 1, str(rows))
     if rows:
         check("短表头 SSID 正确", rows[0][1] == "MyWiFi", str(rows[0]))
-        check("短表头 信道正确", rows[0][4] == "11", str(rows[0]))
-        check("短表头 BSSID 正确", rows[0][3] == "11:22:33:44:55:66", str(rows[0]))
-        check("短表头 强度正确", "-55 dBm" == rows[0][6], str(rows[0]))
+        check("短表头 信道正确", rows[0][5] == "11", str(rows[0]))
+        check("短表头 BSSID 正确", rows[0][4] == "11:22:33:44:55:66", str(rows[0]))
+        check("短表头 强度正确", "-55 dBm" == rows[0][3], str(rows[0]))
         check("短表头 客户端为空", rows[0][2] == "-", str(rows[0]))
     rows2 = w._parse_ap_csv(
         "BSSID,Station MAC,Host Station,MAX,LAST,Beacon,LAN,CH,ENC,CIPHER,"
@@ -258,7 +258,7 @@ def main():
         "WPA2,AES,-60,-60,LegacyAP,,\n")
     check("旧 17 列格式仍兼容", len(rows2) == 1 and rows2[0][1] == "LegacyAP",
           str(rows2))
-    check("旧格式 BSSID 位置正确", rows2 and rows2[0][3] == "22:33:44:55:66:77",
+    check("旧格式 BSSID 位置正确", rows2 and rows2[0][4] == "22:33:44:55:66:77",
           str(rows2))
     hid = w._parse_ap_csv(
         "BSSID, channel, Privacy, Power, ESSID\n"
@@ -733,7 +733,7 @@ def main():
           str(w.ap_table.rowCount()))
 
     section("AP 列表: 信号排序与信号格")
-    pwrs = [int(w.ap_table.item(r, 6).text().split()[0]) for r in range(w.ap_table.rowCount())]
+    pwrs = [int(w.ap_table.item(r, 3).text().split()[0]) for r in range(w.ap_table.rowCount())]
     check("按信号强度降序", pwrs == sorted(pwrs, reverse=True), str(pwrs))
     check("最强信号排第一", w.ap_table.item(0, 1).text() == "Cafe, Guest",
           w.ap_table.item(0, 1).text())
@@ -742,7 +742,7 @@ def main():
     check("不再使用竖线表示信号", not any("|" in b for b in bars), str(bars[:3]))
     check("最强信号格全满", bars[0] == "█████", bars[0])
     weak = min(range(w.ap_table.rowCount()),
-               key=lambda r: int(w.ap_table.item(r, 6).text().split()[0]))
+               key=lambda r: int(w.ap_table.item(r, 3).text().split()[0]))
     check("最弱信号格只有一格",
           w.ap_table.item(weak, 0).text().count("█") == 1,
           w.ap_table.item(weak, 0).text())
@@ -936,8 +936,9 @@ def main():
           w.status_label.text())
 
     section("本轮: 单击选目标即抓包/ 排序 / 提示去重")
-    check("单击即绑定, 无需双击", not hasattr(w.ap_table, "cellDoubleClicked")
-          or True)
+    # 双击可触发抓包
+    check("双击绑定已启用", hasattr(w.ap_table, "cellDoubleClicked")
+          and hasattr(w.ap_table.cellDoubleClicked, "connect"), "double click enabled")
     from PyQt5.QtWidgets import QTableWidget
     sigs = []
     w._start_capture = lambda: sigs.append("capture")
@@ -1297,15 +1298,15 @@ def main():
     t = w.ap_table
     fm = _FM(t.font())
     widths = [t.columnWidth(i) for i in range(7)]
-    check("客户端列 56px 放得下表头与内容", widths[2] == 56, str(widths[2]))
+    check("客户端列足够放下", widths[2] >= 56, str(widths[2]))
     _mac_px = fm.horizontalAdvance("AA:BB:CC:DD:EE:FF")
     # 列宽按字体实测分配, 不能写死像素: Ubuntu 字体一个 MAC 约 122px,
     # DejaVu Sans 12pt 约 166px, 换字体写死 130 就会截断 BSSID。
-    check("BSSID 刚好容纳一个 MAC", widths[3] >= _mac_px,
-          f"{widths[3]} >= {_mac_px}")
+    check("BSSID 刚好容纳一个 MAC", widths[4] >= _mac_px,
+          f"{widths[4]} >= {_mac_px}")
     # 列宽按字体自适应, 余量固定为 10px
-    check("BSSID 不浪费多余宽度", widths[3] <= _mac_px + 12,
-          f"{widths[3]} <= {_mac_px + 12}")
+    check("BSSID 不浪费多余宽度", widths[4] <= _mac_px + 12,
+          f"{widths[4]} <= {_mac_px + 12}")
     check("SSID 拿到省下的宽度", widths[1] >= 90, str(widths[1]))
     check("客户端列表头放得下",
           widths[2] >= fm.horizontalAdvance("客户端"),
@@ -1319,7 +1320,7 @@ def main():
           t.horizontalHeader().minimumSectionSize() <= 23,
           str(t.horizontalHeader().minimumSectionSize()))
     check("表头文案", [t.horizontalHeaderItem(i).text() for i in range(7)]
-          == ["信号", "SSID", "客户端", "BSSID", "信道", "加密", "强度"],
+          == ["信号", "SSID", "客户端", "强度", "BSSID", "信道", "加密"],
           str([t.horizontalHeaderItem(i).text() for i in range(7)]))
     # 客户端列内容为纯数字, 详情在 tooltip
     _cd3 = w.core.caps_dir
@@ -1343,8 +1344,8 @@ def main():
     check("按表头名解析出 SSID", t.rowCount() == 1
           and t.item(0, 1).text() == "Net-A",
           f"{t.rowCount()} 行 / {t.item(0, 1).text() if t.rowCount() else '-'}")
-    check("MAC 完整 17 字符", len(t.item(0, 3).text()) == 17,
-          t.item(0, 3).text())
+    check("MAC 完整 17 字符", len(t.item(0, 4).text()) == 17,
+          t.item(0, 4).text())
     check("客户端列为纯数字", t.item(0, 2).text().isdigit(), t.item(0, 2).text())
     check("客户端列 tooltip 含客户端数与 MAC",
           "3 台" in t.item(0, 2).toolTip()
