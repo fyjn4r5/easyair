@@ -54,6 +54,8 @@ class AirCore:
     def _load_config(self):
         self.config = {
             "wordlists": [],
+            # 默认关闭: airmon-ng check kill 会打断系统网络服务, 代价大
+            "air_monitor_kill_conflicts": False,
             "use_gpu": True,
             "hashcat_extra_args": "",
             "auto_monitor": True,
@@ -159,13 +161,19 @@ class AirCore:
             return True
         return False
 
+    @staticmethod
+    def _iter_caps(directory: Path):
+        """列出目录下所有握手包, 与文件名无关(现在按 WiFi 名称命名)。"""
+        return sorted(set(directory.glob("*.cap")) | set(directory.glob("*.pcap")))
+
     def list_handshakes(self) -> List[Tuple[str, Path, int]]:
         """按日期倒序返回 (日期, 路径, 大小)"""
         out = []
-        caps = list(self.caps_dir.glob("handshake*.cap"))
+        # 文件名现在是 WiFi 名称, 因此不能按前缀匹配, 一律收 .cap/.pcap
+        caps = list(self._iter_caps(self.caps_dir))
         for sub in sorted(self.caps_dir.glob("20??-??-??")):
             if sub.is_dir():
-                caps.extend(sub.glob("handshake*.cap"))
+                caps.extend(self._iter_caps(sub))
         for cap in caps:
             try:
                 st = cap.stat()
@@ -216,8 +224,9 @@ class AirCore:
                 self._password_verified = True
                 self.log(f"[sudo] 密码验证通过")
             else:
-                self.log(f"[sudo] 密码验证失败")
-                pwd = None
+                # 同 _run_sudo_cmd: 密码不可用时直接失败, 不用 pkexec 弹窗
+                self.log(f"[sudo] 密码验证失败：请修正 ~/.Pas 中的密码后重试")
+                raise PermissionError("sudo 密码验证失败")
         
         if pwd:
             full_cmd = ["sudo", "-S", "-p", ""] + args
@@ -231,15 +240,9 @@ class AirCore:
                 errors='replace'
             )
         else:
-            full_cmd = ["pkexec"] + args
-            return subprocess.run(
-                full_cmd,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                encoding='utf-8',
-                errors='replace'
-            )
+            # 理论上不会走到(上面已 raise), 兜底不再用 pkexec 弹窗
+            self.log(f"[sudo] 无可用提权方式，跳过: {' '.join(args)}")
+            return subprocess.CompletedProcess(args, 1, "", "no privilege")
 
     def _run_sudo_cmd(self, cmd: str) -> subprocess.Popen:
         pwd = self._get_sudo_password()
@@ -249,8 +252,13 @@ class AirCore:
                 self._password_verified = True
                 self.log(f"[sudo] 密码验证通过")
             else:
-                self.log(f"[sudo] 密码验证失败，将使用 pkexec")
-                pwd = None
+                # 原来在这里回退 pkexec。密码不对时, 一次 start_monitor 会
+                # 连开好几个 pkexec 模态密码框, 全部堆在桌面上, 系统级阻塞
+                # (时钟都停), 用户必须逐个关掉。改为直接失败并给出明确
+                # 提示, 不再弹窗。
+                self.log(f"[sudo] 密码验证失败：请修正 ~/.Pas 中的密码后重试"
+                         f"（已停用 pkexec 弹窗回退）")
+                raise PermissionError("sudo 密码验证失败")
         
         if pwd:
             full_cmd = ["sudo", "-S", "-p", ""] + shlex.split(cmd)
@@ -347,8 +355,16 @@ class AirCore:
             self.log(f"[监听模式] {iface} 清理后仍是 Monitor 模式，直接使用")
             return subprocess.Popen(["echo", "ALREADY_MONITOR"], stdout=subprocess.PIPE, text=True)
         
-        self.log(f"[监听模式] 杀掉干扰进程...")
-        self._run_sudo(["airmon-ng", "check", "kill"])
+        # 这里原本无条件执行 "airmon-ng check kill"。它会连带杀掉
+        # NetworkManager / wpa_supplicant / dhclient 等一整套网络服务,
+        # 桌面环境的网络状态会长时间空转, 表现为"整机都卡住", 连状态栏
+        # 的系统时钟都不再走动。绝大多数驱动并不需要它, 因此改为按需:
+        # 只有显式开启 air_monitor_kill_conflicts 才执行。
+        if self.config.get("air_monitor_kill_conflicts", False):
+            self.log("[监听模式] 按配置杀掉冲突进程 (airmon-ng check kill)…")
+            self._run_sudo(["airmon-ng", "check", "kill"])
+        else:
+            self.log("[监听模式] 跳过 airmon-ng check kill（会打断系统网络服务）")
         
         self.log(f"[监听模式] 执行: airmon-ng start {iface}")
         p = self._run_sudo_cmd(f"airmon-ng start {iface}")
@@ -466,7 +482,34 @@ class AirCore:
             return self.caps_dir
         return d
 
-    def airodump_capture(self, mon_iface: str, bssid: str, ch: str, outfile_prefix: str = "handshake"):
+    @staticmethod
+    def safe_cap_prefix(essid: str, bssid: str = "") -> str:
+        """把 WiFi 名称(SSID)转成安全的抓包文件名前缀。
+
+        抓包文件改用 WiFi 名称命名(如 "MyHomeWiFi-01.cap"), 但 SSID 由
+        设备自行广播, 可以含空格、斜杠、冒号等在 Windows/FAT 上非法的
+        字符, 因此必须净化后再拼路径。
+        """
+        name = (essid or "").strip()
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name)
+        name = re.sub(r"\s+", " ", name).strip(" .")
+        if not name or name in ("<unknown>", "未选择", "-"):
+            # 隐藏 SSID 没有可用名称, 退回 BSSID, 保证仍可辨识
+            name = (bssid or "").strip().replace(":", "-") or "wifi"
+        # 留出 airodump 自动追加的 "-01.cap" 余量, 并按字节限长
+        while len(name.encode("utf-8")) > 80:
+            name = name[:-1]
+        return name.strip(" .") or "wifi"
+
+    def airodump_capture(self, mon_iface: str, bssid: str, ch: str,
+                         outfile_prefix: str = "", essid: str = ""):
+        """开始抓包。默认用 WiFi 名称(SSID)作为输出文件名前缀。
+
+        airodump 会自动在后面加 "-01", 因此同名 WiFi 重复抓取不会互相
+        覆盖(依次变成 xxx-01.cap / xxx-02.cap)。
+        """
+        if not outfile_prefix:
+            outfile_prefix = self.safe_cap_prefix(essid, bssid)
         outpath = self._dated_dir() / outfile_prefix
         cmd = f"airodump-ng --bssid {bssid} --channel {ch} --output-format pcap,csv -w {outpath} {mon_iface}"
         return self.run_cmd(cmd, sudo=True)
@@ -504,12 +547,10 @@ class AirCore:
         return self.run_cmd(cmd)
 
     def get_latest_handshake(self) -> Optional[Path]:
-        caps = list(self.caps_dir.glob("handshake-*.cap"))
+        caps = list(self._iter_caps(self.caps_dir))
         for sub in sorted(self.caps_dir.glob("20??-??-??"), reverse=True):
             if sub.is_dir():
-                caps.extend(sub.glob("handshake-*.cap"))
-        if not caps:
-            return None
+                caps.extend(self._iter_caps(sub))
         if not caps:
             return None
         return max(caps, key=lambda x: x.stat().st_mtime)

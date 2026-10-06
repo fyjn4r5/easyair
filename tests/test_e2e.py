@@ -1255,9 +1255,10 @@ def main():
     # DejaVu Sans 12pt 约 166px, 换字体写死 130 就会截断 BSSID。
     check("BSSID 刚好容纳一个 MAC", widths[3] >= _mac_px,
           f"{widths[3]} >= {_mac_px}")
-    check("BSSID 不浪费多余宽度", widths[3] <= _mac_px + 8,
-          f"{widths[3]} <= {_mac_px + 8}")
-    check("SSID 拿到省下的宽度", widths[1] >= 179, str(widths[1]))
+    # 列宽按字体自适应, 余量固定为 10px
+    check("BSSID 不浪费多余宽度", widths[3] <= _mac_px + 12,
+          f"{widths[3]} <= {_mac_px + 12}")
+    check("SSID 拿到省下的宽度", widths[1] >= 90, str(widths[1]))
     check("端列表头缩写放得下",
           widths[2] >= fm.horizontalAdvance("端"),
           f"{widths[2]} >= {fm.horizontalAdvance('端')}")
@@ -1395,6 +1396,96 @@ def main():
           "破解中" in _w3.log_crack_box.toPlainText())
     _w3.close()
     pump(100)
+
+    section("倒计时不再等待监听模式")
+    # 回归: 点扫描后必须立刻出现倒计时。之前计时在 _do_scan() 里, 而
+    # _do_scan() 要等 start_monitor, 表现为"按下没反应"。
+    w2 = M.EasyAirApp()
+    w2.mon_iface = None
+    w2.core.check_monitor_mode = lambda i: False
+    w2.core.start_monitor = lambda i: subprocess.Popen(["sleep", "30"])
+    w2._start_scan()
+    app.processEvents()
+    check("按下扫描立刻起表", bool(w2.scan_start_time), str(w2.scan_start_time))
+    check("立刻显示倒计时", "45s" in w2.scan_elapsed.text(), w2.scan_elapsed.text())
+    w2._disarm_scan_clock()
+    check("停止后表已复位", w2.scan_start_time == 0)
+
+    section("提权失败不再弹 pkexec")
+    # 回归: 密码错误时一次开监听会连弹好几个 pkexec 模态框, 系统级阻塞
+    w3 = M.EasyAirApp()
+    w3.mon_iface = None
+    w3.core.check_monitor_mode = lambda i: False
+    w3.core._get_sudo_password = lambda: "definitely-wrong"
+    w3.core._verify_sudo_password = lambda p: False
+    _seen = []
+    _real_popen = subprocess.Popen
+    def _spy(cmd, *a, **k):
+        if "pkexec" in str(cmd):
+            _seen.append(cmd)
+        return _real_popen(cmd, *a, **k)
+    subprocess.Popen = _spy
+    try:
+        w3._start_scan()
+        for _ in range(80):
+            app.processEvents(); time.sleep(0.02)
+            if w3.btn_scan.isEnabled():
+                break
+    finally:
+        subprocess.Popen = _real_popen
+    check("未弹出任何 pkexec 进程", not _seen, str(_seen[:2]))
+    check("失败后按钮复位", w3.btn_scan.isEnabled(), w3.btn_scan.text())
+    check("失败后倒计时复位", w3.scan_start_time == 0)
+
+    section("不再执行 airmon-ng check kill")
+    # 回归: check kill 会杀掉 NetworkManager 等一整套网络服务,
+    # 表现为整机卡顿(连系统时钟都停), 默认必须跳过。
+    w4 = M.EasyAirApp()
+    _ran = []
+    w4.core._cleanup_monitor = lambda i: None
+    w4.core.check_monitor_mode = lambda i: False
+    w4.core._run_sudo = lambda args: _ran.append(" ".join(args)) or \
+        subprocess.CompletedProcess(args, 0, "", "")
+    w4.core.start_monitor("wlan0")
+    check("未执行 check kill",
+          not any("check kill" in x for x in _ran), str(_ran))
+    w4.core.config["air_monitor_kill_conflicts"] = True
+    _ran.clear()
+    w4.core.start_monitor("wlan0")
+    check("显式开启后才执行",
+          any("check kill" in x for x in _ran), str(_ran))
+
+    section("握手包按 WiFi 名称命名")
+    _sp = w.core.safe_cap_prefix
+    check("普通 SSID 原样保留", _sp("MyHomeWiFi_5G", "AA:BB:CC:DD:EE:FF")
+          == "MyHomeWiFi_5G", _sp("MyHomeWiFi_5G", "AA:BB:CC:DD:EE:FF"))
+    check("含空格保留单空格", _sp("My WiFi", "AA:BB:CC:DD:EE:FF") == "My WiFi",
+          _sp("My WiFi", "AA:BB:CC:DD:EE:FF"))
+    check("非法字符被替换",
+          _sp("a/b:c*d?e\"f<g>h|i", "AA:BB:CC:DD:EE:FF")
+          == "a_b_c_d_e_f_g_h_i",
+          _sp("a/b:c*d?e\"f<g>h|i", "AA:BB:CC:DD:EE:FF"))
+    check("中文 SSID 保留", _sp("无线网络", "AA:BB:CC:DD:EE:FF") == "无线网络",
+          _sp("无线网络", "AA:BB:CC:DD:EE:FF"))
+    check("隐藏 SSID 退回 BSSID",
+          _sp("", "AA:BB:CC:DD:EE:FF") == "AA-BB-CC-DD-EE-FF", _sp("", "AA:BB:CC:DD:EE:FF"))
+    check("超长 SSID 截断到 80 字节内",
+          len(_sp("长" * 200, "AA:BB:CC:DD:EE:FF").encode("utf-8")) <= 80,
+          str(len(_sp("长" * 200, "AA:BB:CC:DD:EE:FF").encode("utf-8"))))
+    # 枚举握手包不再依赖 handshake 前缀
+    _d = w.core.caps_dir / "2026-01-01"
+    _d.mkdir(parents=True, exist_ok=True)
+    for _n in ("MyHomeWiFi-01.cap", "Cafe-01.cap", "random.pcap"):
+        (_d / _n).write_bytes(b"x")
+    _got = {p.name for p in w.core._iter_caps(_d)}
+    check("能列出任意命名的 cap/pcap",
+          {"MyHomeWiFi-01.cap", "Cafe-01.cap", "random.pcap"} <= _got,
+          str(sorted(_got)))
+    _pk = {d: path.name for d, path, _sz in w.core.list_handshakes()}
+    check("握手库列出按 WiFi 命名的包",
+          _pk.get("2026-01-01") is not None, str(_pk))
+    for _n in ("MyHomeWiFi-01.cap", "Cafe-01.cap", "random.pcap"):
+        (_d / _n).unlink()
 
     section("关闭时清理线程")
     w2.close()

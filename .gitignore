@@ -14,3 +14,12 @@ wordlists/*
 /easyair_*
 *.zip
 无标题文档
+
+# 抓包产物与本地工具生成的报告, 不入库
+*.cap
+*.pcap
+*.pcapng
+*.hc22000
+错误日志
+qapplication-nameerror-in-pyinstaller-build.json
+captures/

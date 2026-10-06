@@ -372,8 +372,15 @@ class EasyAirApp(MainUI):
         proc = None
         try:
             proc = self.core.start_monitor(physical)
+        except PermissionError as e:
+            self.set_monitor_status("error")
+            btn.setEnabled(True)
+            self.set_status("无 root 权限，无法开启监听")
+            self.log(f"[监听开启失败] {e}")
+            return False
         except Exception as e:  # noqa: BLE001
-            print(f"[监听开启异常] {e}")
+            self.log(f"[监听开启异常] {e}")
+            proc = None
         if not proc:
             self.set_monitor_status("error")
             btn.setEnabled(True)
@@ -449,6 +456,7 @@ class EasyAirApp(MainUI):
             self.set_status(f"监听中 · 可直接扫描或抓取握手包")
             return
 
+        self._disarm_scan_clock()
         self.log("监听模式开启失败 · 未检测到 monitor 接口")
         self.set_monitor_status("error")
         self.btn_mon_toggle.setChecked(False)
@@ -868,6 +876,10 @@ class EasyAirApp(MainUI):
         if not self._preflight_scan():
             return
 
+        # 先起表, 再开监听: 等待监听的每一秒都算进扫描时间, 界面也
+        # 立刻给出反馈, 不会出现"按了没反应"
+        self._arm_scan_clock()
+
         # 监听模式已就绪则直接扫, 不必重启监听(重启会打断已有会话)
         if self.mon_iface and self.core.check_monitor_mode(self.mon_iface):
             self.set_status("正在启动 airodump-ng…")
@@ -881,11 +893,28 @@ class EasyAirApp(MainUI):
         self.btn_scan.setEnabled(False)
         self.btn_scan.setText("⏳ 开启监听中…")
 
-        self._run_worker(lambda: self.core.start_monitor(physical),
-                         self._on_mon_ready_for_scan)
+        def _start_mon():
+            try:
+                return self.core.start_monitor(physical)
+            except PermissionError as e:
+                self.log(f"[监听开启失败] {e}")
+                return None
+            except Exception as e:  # noqa: BLE001
+                self.log(f"[监听开启异常] {e}")
+                return None
 
-    def _on_mon_ready_for_scan(self):
+        self._run_worker(_start_mon, self._on_mon_ready_for_scan)
+
+    def _on_mon_ready_for_scan(self, proc=None):
         """监听模式就绪，开始扫描"""
+        if proc is None:
+            self._disarm_scan_clock()
+            self.btn_scan.setEnabled(True)
+            self.btn_scan.setText("🔍 扫描")
+            self.set_scan_status("idle")
+            self.set_monitor_status("error")
+            self.set_status("开启监听失败 · 请检查网卡与 root 权限")
+            return
         physical = self.physical_iface
 
         def _detect():
@@ -909,10 +938,15 @@ class EasyAirApp(MainUI):
         self.btn_scan.setText("🔍 扫描")
         self.set_status("监听模式开启失败 · 无法扫描")
 
-    def _do_scan(self):
-        """实际开始 airodump-ng 扫描"""
-        self.log(f"> 扫描 AP: {self.mon_iface}")
-        self.btn_scan.setText("⏹ 扫描中")
+    def _arm_scan_clock(self):
+        """从用户点"扫描"这一刻起计时, 与监听模式是否就绪无关。
+
+        之前把计时放在 _do_scan() 里, 而 _do_scan() 必须等 start_monitor
+        完成(两次 worker 往返 + airmon-ng, 实测 1~4s)。表现为按下扫描后
+        倒计时长时间不出现, 用户以为没反应 —— 而这段时间里真正的
+        airodump-ng 可能还没启动, 等于扫描时间凭空少了几秒。"""
+        if self.scan_start_time:
+            return False
         self.scan_start_time = time.time()
         self._scan_warned = False
         self.scan_deadline = (time.time() + self.scan_auto_stop
@@ -922,6 +956,23 @@ class EasyAirApp(MainUI):
         self._last_clock_text = ""
         self.tick_timer.start()
         self.scan_elapsed.setText(self._scan_elapsed_text())
+        return True
+
+    def _disarm_scan_clock(self):
+        self.scan_start_time = 0
+        self.scan_deadline = None
+        self._autostop_firing = False
+        self._last_clock_text = ""
+        if hasattr(self, "tick_timer"):
+            self.tick_timer.stop()
+        if hasattr(self, "scan_elapsed"):
+            self.scan_elapsed.setText(self._scan_elapsed_text())
+
+    def _do_scan(self):
+        """实际开始 airodump-ng 扫描"""
+        self.log(f"> 扫描 AP: {self.mon_iface}")
+        self.btn_scan.setText("⏹ 扫描中")
+        self._arm_scan_clock()
         if self.scan_deadline:
             self.log(f"[扫描] 将在 {self.scan_auto_stop} 秒后自动停止")
         else:
@@ -1365,9 +1416,13 @@ class EasyAirApp(MainUI):
         # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
         # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL,
         # 结果就是抓到的 cap 里没有握手包 —— 导入 eWSA 显示"无数据"。
+        # 抓包文件按 WiFi 名称命名, 如 "MyHomeWiFi-01.cap"
+        cap_prefix = self.core.safe_cap_prefix(essid, bssid)
+        self._cap_prefix = cap_prefix
+
         def _capture():
             proc = self.core.airodump_capture(
-                self.mon_iface, bssid, ch, "handshake")
+                self.mon_iface, bssid, ch, cap_prefix)
             if not proc:
                 return None
             # 记下这个包属于哪个 AP: .cap 本身不含可读的 SSID,
@@ -1375,9 +1430,10 @@ class EasyAirApp(MainUI):
             self._cap_essid = essid
             self._cap_bssid = bssid
             self._cap_ch = ch
-            for f in sorted(self.core._dated_dir().glob("handshake*.cap")):
-                self.core.set_cap_meta(
-                    f, {"essid": essid, "bssid": bssid, "channel": ch})
+            for f in self.core._iter_caps(self.core._dated_dir()):
+                if f.name.startswith(cap_prefix):
+                    self.core.set_cap_meta(
+                        f, {"essid": essid, "bssid": bssid, "channel": ch})
             # 等 airodump 完成握手再发 deauth
             time.sleep(2.0)
             dp = self.core.deauth(self.mon_iface, bssid, 10)
@@ -1401,7 +1457,17 @@ class EasyAirApp(MainUI):
         self.cap_thread = self._spawn_cmd(p, self.log_scan)
 
     def _check_handshake(self):
-        cap = self.core.get_latest_handshake()
+        cap = None
+        # 只认本次抓包产生的前缀, 否则历史遗留的 cap 会让"已捕获"提前
+        # 亮绿灯(实测这会让界面显示成功但文件其实是旧的)
+        pref = getattr(self, "_cap_prefix", "")
+        if pref:
+            same = [f for f in self.core._iter_caps(self.core._dated_dir())
+                    if f.name.startswith(pref)]
+            if same:
+                cap = max(same, key=lambda x: x.stat().st_mtime)
+        if cap is None:
+            cap = self.core.get_latest_handshake()
         if cap:
             self.lbl_handshake.setText(f"握手包 {cap.name}")
             self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
@@ -1687,7 +1753,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.12.4"
+VERSION = "1.12.5"
 
 
 def _selftest() -> int:

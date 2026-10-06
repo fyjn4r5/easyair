@@ -460,15 +460,7 @@ class MainUI(QWidget):
         # 任何小于它的 setColumnWidth 都会被悄悄抬回 57 —— 这就是"端"列
         # 无论如何都缩不下去的原因。这里显式降到 12px 才能真正收窄。
         ap_header.setMinimumSectionSize(12)
-        # 信号44 / 端23 / 信道44 / 加密88 / 强度52 固定, 余下在 SSID 与
-        # BSSID 之间分配: BSSID 取"实测 MAC 宽度 + 6px 余量", SSID 拿剩下的,
-        # 两列之和恒为 532, 因此总宽仍为 602, 不改变表格整体占位。
-        _fixed = 44 + 23 + 44 + 88 + 52
-        _bssid = QFontMetrics(self.ap_table.font()).horizontalAdvance(
-            "AA:BB:CC:DD:EE:FF") + 6
-        _ssid = 602 - _fixed - _bssid
-        for idx, w in enumerate((44, _ssid, 23, _bssid, 44, 88, 52)):
-            self.ap_table.setColumnWidth(idx, w)
+        self._apply_ap_column_widths()
         self.ap_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.ap_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.ap_table.setAlternatingRowColors(True)
@@ -779,6 +771,29 @@ class MainUI(QWidget):
             if hasattr(self, 'tray_icon'):
                 self.tray_icon.setIcon(self.icon_error)
                 self.tray_icon.setToolTip("EasyAir - 监听模式: 错误")
+
+    def _apply_ap_column_widths(self):
+        """按当前生效字体重新计算 AP 表列宽。
+
+        列宽不能写死像素, 也不能只在 __init__ 里算一次: 样式表应用后字体
+        会变(本机 MAC 需 122px, CI 容器需 166px), 构造期量到的值到运行期
+        就不够了, 结果 BSSID 被截断。因此每次显示前重算。
+        信号/端/信道/加密/强度 固定, 余下在 SSID 与 BSSID 之间分配, 两者
+        之和恒定, 保证总宽不因字体差异而改变。
+        """
+        fixed = 44 + 23 + 44 + 88 + 52
+        need = QFontMetrics(self.ap_table.font()).horizontalAdvance(
+            "AA:BB:CC:DD:EE:FF") + 10
+        bssid = max(need, 60)
+        ssid = max(90, 602 - fixed - bssid)
+        self._AP_WIDTHS = [44, ssid, 23, bssid, 44, 88, 52]
+        for idx, w in enumerate(self._AP_WIDTHS):
+            self.ap_table.setColumnWidth(idx, w)
+
+    def showEvent(self, event):
+        # 字体在首次显示后才最终确定, 这里补算一次列宽
+        super().showEvent(event)
+        self._apply_ap_column_widths()
 
     def set_scan_status(self, status: str):
         if status == "idle":
