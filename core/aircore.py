@@ -465,6 +465,56 @@ class AirCore:
                f"--output-format csv{background_arg()} -w {outpath}")
         return self.run_cmd(cmd, sudo=True)
 
+    def start_client_sniffer(self, mon_iface: str):
+        """独立客户端嗅探: tcpdump 只抓 802.11 数据帧(BPF 在内核过滤)。
+
+        背景: 实测 airodump-ng 1.6 在本机监听接口上, Station 段长期只写
+        "(not associated)" —— 即使网卡明明抓到了客户端数据帧(tcpdump 可见
+        SA→BSSID 的 Data, AP 的 IV 计数也在涨)。于是 AP 表"客户端"列永远
+        为 0。这不是解析 bug, 是 airodump 不归因。用 tcpdump 兜底, 把真实
+        在线的已关联客户端找回来。数据帧远少于 beacon, 开销很小。
+        """
+        if not shutil.which("tcpdump"):
+            return None
+        try:
+            return self.run_cmd(
+                f"tcpdump -i {mon_iface} -e -l -nn type data", sudo=True)
+        except (OSError, PermissionError, ValueError):
+            return None
+
+    @staticmethod
+    def parse_sniffer_line(line: str):
+        """解析 tcpdump -e 的一行数据帧, 返回 (client_mac, ap_bssid)。
+
+        实测行例:
+        ... DA:ff:ff:ff:ff:ff:ff BSSID:6c:11:ba:9f:63:ef
+            SA:98:3f:a4:67:36:d0 Data IV:45c1 Pad 20 KeyID 1
+        客户端→AP: SA 即客户端; AP→客户端: SA==BSSID, 客户端在 DA。
+        """
+        if "BSSID:" not in line or "SA:" not in line:
+            return None
+        if " Data" not in line and "QoS" not in line and " CF" not in line:
+            return None
+        sa = re.search(r"\bSA:([0-9A-Fa-f:]{17})\b", line)
+        bs = re.search(r"\bBSSID:([0-9A-Fa-f:]{17})\b", line)
+        da = re.search(r"\bDA:([0-9A-Fa-f:]{17})\b", line)
+        if not sa or not bs:
+            return None
+        bssid = bs.group(1).upper()
+        client = sa.group(1).upper()
+        if client == bssid:
+            if not da:
+                return None
+            client = da.group(1).upper()
+        # 组播/广播/生成树等不是客户端
+        if (client == bssid or client.startswith("FF:")
+                or client.startswith(("01:00:5E", "33:33",
+                                      "01:80:C2", "01:0C"))):
+            return None
+        if not re.match(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$", client):
+            return None
+        return client, bssid
+
     @staticmethod
     def supports_background_probe() -> bool:
         """预热 `--background` 能力缓存, 避免第一次扫描时同步探测阻塞。"""

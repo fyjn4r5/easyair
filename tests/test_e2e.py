@@ -1732,6 +1732,75 @@ def main():
     check("导出含 WiFi 名称", "ExpWiFi" in _content, _content[:80])
     check("导出含密码", "pass123" in _content, _content[:160])
 
+    section("数据帧嗅探(补 airodump 不列关联客户端)")
+    import core.aircore as _AC
+    _P = _AC.AirCore.parse_sniffer_line
+    # 真机 tcpdump -e 实测行: 客户端→AP(SA 即客户端)
+    _l1 = ("16:42:17.920218 315872429us tsft 6.0 Mb/s 2412 MHz 11g "
+           "-65dBm signal antenna 0 DA:ff:ff:ff:ff:ff:ff "
+           "BSSID:6c:11:ba:9f:63:ef SA:98:3f:a4:67:36:d0 "
+           "Data IV:45c1 Pad 20 KeyID 1")
+    check("客户端→AP 解析出客户端", _P(_l1) == ("98:3F:A4:67:36:D0",
+          "6C:11:BA:9F:63:EF"), str(_P(_l1)))
+    # 组播 DA 的数据帧: 客户端仍是 SA(真机实测 b0:68→ZX001)
+    _l2 = ("16:37:54.085544 52035871us tsft 2.0 Mb/s 2412 MHz 11b "
+           "-62dBm signal antenna 0 DA:01:00:5e:7f:ff:fa "
+           "BSSID:e0:b6:68:cd:bb:f7 SA:b0:68:e6:c1:c9:07 "
+           "Data IV:2850 Pad 20 KeyID 1")
+    check("组播DA仍取SA为客户端", _P(_l2) == ("B0:68:E6:C1:C9:07",
+          "E0:B6:68:CD:BB:F7"), str(_P(_l2)))
+    # AP 下发的帧(SA==BSSID): 客户端在 DA
+    _l3 = ("16:42:20.235714 x DA:22:9f:df:06:db:b7 "
+           "BSSID:9a:93:51:67:27:fa SA:9a:93:51:67:27:fa QoS Data")
+    check("AP下发帧取DA为客户端", _P(_l3) == ("22:9F:DF:06:DB:B7",
+          "9A:93:51:67:27:FA"), str(_P(_l3)))
+    _l4 = ("16:36:07.664811 x BSSID:84:87:ff:aa:36:74 "
+           "DA:ff:ff:ff:ff:ff:ff SA:84:87:ff:aa:36:74 Beacon (X)")
+    check("Beacon 不算客户端", _P(_l4) is None, str(_P(_l4)))
+    check("无BSSID行不算", _P("garbage line") is None, "x")
+    # _on_sniffer_line 累积
+    w._sniffed_clients = {}
+    w._sniff_noticed = True  # 不刷日志
+    w._on_sniffer_line(_l1)
+    w._on_sniffer_line(_l2)
+    w._on_sniffer_line(_l1)  # 重复不重复计
+    check("嗅探累积两 AP",
+          set(w._sniffed_clients) == {"6C:11:BA:9F:63:EF",
+                                      "E0:B6:68:CD:BB:F7"},
+          str(w._sniffed_clients))
+    check("去重", w._sniffed_clients["6C:11:BA:9F:63:EF"]
+          == {"98:3F:A4:67:36:D0"}, "")
+    # AP 表合并嗅探: airodump 报 0 客户端, 表格仍应显示 1
+    _ap_sec = ("BSSID, First time seen, Last time seen, channel, Speed, "
+               "Privacy, Cipher, Authentication, Power, # beacons, # IV, "
+               "LAN IP, ID-length, ESSID, Key\n"
+               "6C:11:BA:9F:63:EF, 2026-10-07 16:42:10, 2026-10-07 "
+               "16:42:20, 1, 324, WPA2, CCMP, PSK, -64, 9, 2, "
+               "0.0.0.0, 9, CMCC-8979, \n")
+    _rows = w._parse_ap_csv(_ap_sec, {})
+    check("嗅探客户端计入表格",
+          len(_rows) == 1 and _rows[0][7] == 1 and _rows[0][2] == "1",
+          str(_rows))
+    check("tooltip 标注嗅探",
+          "嗅探" in w._client_tips.get("6C:11:BA:9F:63:EF", ""),
+          w._client_tips.get("6C:11:BA:9F:63:EF", ""))
+    w._sniffed_clients = {}
+    # 引用计数: 扫描释放后抓包仍保活
+    w._sniffer_users = set()
+    w._sniffer_thread = None
+    _fake = type("T", (), {"stop": lambda self: setattr(
+        self, "stopped", True)})()
+    w._sniffer_thread = _fake
+    w._sniffer_users = {"scan", "capture"}
+    w._sniffer_release("scan")
+    check("抓包仍在用不断嗅探",
+          w._sniffer_thread is _fake and not getattr(_fake, "stopped", False),
+          "")
+    w._sniffer_release("capture")
+    check("没人用才停嗅探",
+          w._sniffer_thread is None and getattr(_fake, "stopped", False), "")
+
+
     section("关闭时清理线程")
     w2.close()
     pump(100)

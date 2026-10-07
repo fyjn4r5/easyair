@@ -159,6 +159,13 @@ class EasyAirApp(MainUI):
         self.core = AirCore()
         self.scan_thread = None
         self.cap_thread = None
+        # 独立客户端嗅探(tcpdump data 帧): airodump 的 Station 段在本机
+        # 监听接口上长期只写 "(not associated)", 客户端列永远为 0 ——
+        # 用嗅探兜底, {BSSID: {client_mac}}。引用计数, 扫描/抓包共享。
+        self._sniffer_thread = None
+        self._sniffer_users = set()
+        self._sniffed_clients = {}
+        self._sniff_noticed = False
         self.crack_thread = None
         self.conv_thread = None
         self.mon_thread = None
@@ -1185,6 +1192,9 @@ class EasyAirApp(MainUI):
     def _do_scan(self):
         """实际开始 airodump-ng 扫描"""
         self.log(f"> 扫描 AP: {self.mon_iface}")
+        # 新一轮扫描: 嗅探缓存清零, 避免上一轮的客户端"阴魂不散"
+        self._sniffed_clients = {}
+        self._sniff_noticed = False
         self.btn_scan.setText("⏹ 扫描中")
         self._arm_scan_clock()
         if self.scan_deadline:
@@ -1210,6 +1220,9 @@ class EasyAirApp(MainUI):
         t.finished.connect(lambda th=t: self._forget_scan_thread(th))
         if hasattr(t, "exited"):
             t.exited.connect(self._on_scan_exit_code)
+        # 扫描期间同步嗅探数据帧: airodump 的 Station 段经常只写
+        # "(not associated)", 客户端全靠嗅探找回来
+        self._sniffer_acquire("scan")
         self.set_status("正在搜索周边 AP…")
 
     def _forget_scan_thread(self, th):
@@ -1319,6 +1332,8 @@ class EasyAirApp(MainUI):
                 # terminate() 只保证杀掉 sudo 这层, 真正的 airodump 可能还活着;
                 # 再按命令行补一次兜底清理, 否则残余进程会一直刷输出。
                 self._run_worker(self.core.kill_scan_processes, None)
+            # 扫描结束释放嗅探器(抓包还在用则不断, 引用计数)
+            self._sniffer_release("scan")
             self.scan_timer.stop()
             self.tick_timer.stop()
             self.scan_deadline = None
@@ -1552,8 +1567,20 @@ class EasyAirApp(MainUI):
             except (TypeError, ValueError):
                 pwr_int = None
             enc_col = f"{priv}/{cipher}".strip("/") if cipher else priv
-            # 客户端信息: 第 8 列(真实存在于 airodump CSV 的 Station 段)
-            clients = stations_by_bssid.get(bssid.upper(), []) if stations_by_bssid else []
+            # 客户端信息: airodump Station 段 + tcpdump 数据帧嗅探取并集。
+            # 实测 airodump 在本机监听接口上长期只写 "(not associated)",
+            # 即使网卡明明抓到了客户端数据帧 —— 不合并嗅探, 客户端列永远为 0。
+            clients = list(stations_by_bssid.get(bssid.upper(), [])
+                           if stations_by_bssid else [])
+            have = {c["mac"] for c in clients}
+            extra = sorted((getattr(self, "_sniffed_clients", None)
+                            or {}).get(bssid.upper(), ()))
+            sniff_n = 0
+            for m in extra:
+                if m not in have:
+                    have.add(m)
+                    sniff_n += 1
+                    clients.append({"mac": m, "power": "", "packets": ""})
             client_count = len(clients)
             self._ap_clients[bssid.upper()] = [c["mac"] for c in clients]
             client_str = f"{client_count} 客户端"
@@ -1565,6 +1592,8 @@ class EasyAirApp(MainUI):
                 # 列宽 23px 放不下"N 台", 只显示数字, 详情走 tooltip
                 client_str = str(client_count)
                 client_tip = f"{client_count} 台在线客户端: {macs}"
+                if sniff_n:
+                    client_tip += f" · 其中{sniff_n}个由数据帧嗅探发现"
             else:
                 client_str = "-"
                 client_tip = "无在线客户端"
@@ -1688,6 +1717,9 @@ class EasyAirApp(MainUI):
         self.log(f"[抓包] 目标: {essid} | {bssid} | CH{ch}")
         self.bottom_tabs.setCurrentWidget(self.log_scan_box)
         self.set_status("正在抓取握手包…")
+        # 新一轮抓包: 嗅探缓存清零, 只统计本轮目标的在线客户端
+        self._sniffed_clients = {}
+        self._sniff_noticed = False
 
         # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
         # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL,
@@ -1761,6 +1793,8 @@ class EasyAirApp(MainUI):
             self.set_status("抓包启动失败")
             return
         self.cap_thread = self._spawn_cmd(p, self.log_scan)
+        # 抓包锁定在目标信道, 嗅探数据帧找在线客户端(可定向 deauth)
+        self._sniffer_acquire("capture")
 
     def _retry_deauth(self):
         """抓不到握手就周期性重发 deauth, 直到成功或用户停止。"""
@@ -1905,7 +1939,9 @@ class EasyAirApp(MainUI):
             return
         station_sec = txt.split("Station MAC", 1)[1]
         stations = self._parse_station_section(station_sec)
-        macs = [c["mac"] for c in stations.get(bssid, [])]
+        macs = sorted(set([c["mac"] for c in stations.get(bssid, [])])
+                      | set((getattr(self, "_sniffed_clients", None)
+                             or {}).get(bssid, ())))
         self._ap_clients[bssid] = macs
         combo = getattr(self, "client_combo", None)
         if combo is None:
@@ -1924,6 +1960,69 @@ class EasyAirApp(MainUI):
             combo.setCurrentIndex(i if i >= 0 else 0)
         combo.blockSignals(False)
         self.log(f"[客户端] {bssid} 在线客户端更新为 {len(macs)} 个")
+
+    # ===== 独立客户端嗅探(tcpdump data 帧, 补 airodump 不列关联客户端) =====
+    def _sniffer_acquire(self, tag: str):
+        """扫描/抓包声明使用嗅探器; 第一个使用者负责启动。"""
+        users = getattr(self, "_sniffer_users", None)
+        if users is None:
+            users = self._sniffer_users = set()
+        users.add(tag)
+        if getattr(self, "_sniffer_thread", None) is not None:
+            return
+        mon = self.mon_iface
+        if not mon:
+            return
+        self._run_worker(lambda: self.core.start_client_sniffer(mon),
+                         self._on_sniffer_started)
+
+    def _on_sniffer_started(self, proc):
+        if not proc:
+            return
+        if getattr(self, "_sniffer_thread", None) is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return
+        t = self._spawn_cmd(proc, self._on_sniffer_line)
+        t.finished.connect(lambda: self._forget_sniffer(t))
+        self._sniffer_thread = t
+        self.log("[客户端] 已启动数据帧嗅探(补全在线客户端)")
+
+    def _forget_sniffer(self, t):
+        if getattr(self, "_sniffer_thread", None) is t:
+            self._sniffer_thread = None
+
+    def _sniffer_release(self, tag: str):
+        """释放使用声明; 没人用时才真正停掉嗅探器。"""
+        users = getattr(self, "_sniffer_users", set())
+        users.discard(tag)
+        if users:
+            return
+        t = getattr(self, "_sniffer_thread", None)
+        self._sniffer_thread = None
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:
+                pass
+
+    def _on_sniffer_line(self, line: str):
+        try:
+            hit = self.core.parse_sniffer_line(line)
+        except Exception:
+            return
+        if not hit:
+            return
+        mac, bssid = hit
+        bag = self._sniffed_clients.setdefault(bssid, set())
+        if mac in bag:
+            return
+        bag.add(mac)
+        if not getattr(self, "_sniff_noticed", False):
+            self._sniff_noticed = True
+            self.log(f"[客户端] 嗅探到在线客户端 {mac} (AP {bssid})")
 
     def _auto_on_target_done(self, cap):
         """全自动模式: 记录本次成功, 然后抓下一个。"""
@@ -1958,6 +2057,8 @@ class EasyAirApp(MainUI):
     def _stop_capture(self, quiet: bool = False):
         self._capture_running = False
         self._stop_capture_timers()
+        # 抓包结束释放嗅探器(扫描还在用则不断, 引用计数)
+        self._sniffer_release("capture")
         if getattr(self, 'cap_thread', None):
             try:
                 self.cap_thread.stop()
@@ -2370,7 +2471,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.15.0"
+VERSION = "1.16.0"
 
 
 def _selftest() -> int:
