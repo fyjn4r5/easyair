@@ -149,7 +149,7 @@ class CrackResultWidget(QTreeWidget):
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
     def add_target(self, bssid, essid, cap_file, note=""):
-        item = QTreeWidgetItem([bssid, essid, "破解中...", cap_file, "进行中", "00:00", note])
+        item = QTreeWidgetItem([bssid, essid, "", cap_file, "进行中", "00:00", note])
         item.setData(0, Qt.UserRole, {"bssid": bssid, "essid": essid, "cap": cap_file})
         self.addTopLevelItem(item)
         return item
@@ -166,9 +166,12 @@ class CrackResultWidget(QTreeWidget):
         }
 
     def load_record(self, rec: dict):
+        pwd = rec.get("password", "") or ""
+        if pwd == "破解中...":      # 旧记录里遗留的占位, 统一显示为空
+            pwd = ""
         item = QTreeWidgetItem([
             rec.get("bssid", ""), rec.get("essid", ""),
-            rec.get("password", "") or "破解中...",
+            pwd,
             rec.get("cap", ""), rec.get("status", ""),
             rec.get("elapsed", ""), rec.get("note", ""),
         ])
@@ -495,7 +498,12 @@ class MainUI(QWidget):
         self.btn_capture = QPushButton("📡 抓握手包")
         self.btn_capture.setStyleSheet("font-weight: bold;")
         self.btn_capture.setToolTip("自动对目标 AP 发送 deauth 促使客户端重连，并抓取握手包（双击AP表格也可开始/停止）")
-        for b in (self.btn_scan, self.btn_capture):
+        self.btn_auto_cap = QPushButton("⚡ 全自动抓包")
+        self.btn_auto_cap.setStyleSheet("font-weight: bold;")
+        self.btn_auto_cap.setToolTip(
+            "自动依次抓取当前所有「有在线客户端」的 AP 握手包, 抓到即自动加入右侧\n"
+            "（先扫描出 AP 后再点）")
+        for b in (self.btn_scan, self.btn_capture, self.btn_auto_cap):
             b.setMinimumHeight(32)
             ctrl_layout.addWidget(b, 1)
         ap_group_layout.addLayout(ctrl_layout)
@@ -624,6 +632,14 @@ class MainUI(QWidget):
         self.cap_tree.setAlternatingRowColors(True)
         self.cap_tree.setRootIsDecorated(True)
         cap_layout.addWidget(self.cap_tree)
+        cap_btns = QHBoxLayout()
+        cap_btns.setSpacing(6)
+        self.btn_cap_add = QPushButton("➕ 加入右侧破解")
+        self.btn_cap_add.setToolTip(
+            "在下方握手包库中按住 Ctrl 或 Shift 多选一个/多个握手包, 加入右侧破解列表")
+        cap_btns.addWidget(self.btn_cap_add)
+        cap_btns.addStretch()
+        cap_layout.addLayout(cap_btns)
         self.bottom_tabs.addTab(cap_page, "📦 握手包库  (双击载入)")
 
         self.log_scan_box = self._make_log_box()

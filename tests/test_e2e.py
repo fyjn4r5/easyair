@@ -1183,7 +1183,8 @@ def main():
     tgt = top.child(1)
     tname = tgt.data(0, _Qt.UserRole)
     _orig_exec = _QMenu.exec_
-    _QMenu.exec_ = lambda self, *a: self.actions()[0]      # "删除选中"
+    _QMenu.exec_ = lambda self, *a: next(
+        (x for x in self.actions() if "删除" in x.text()), self.actions()[0])
     _orig_q = _QMB.question
     _QMB.question = staticmethod(lambda *a, **k: _QMB.Yes)
     try:
@@ -1574,17 +1575,26 @@ def main():
     ran.clear()
     w._check_handshake()
     check("文件未变化不重复校验", len(ran) == 0, str(len(ran)))
-    # 真含握手才报成功
+    # 真含握手才报成功(会自动停止抓包, 并提示是否加入右侧)
     w.core.has_handshake = lambda cap: True
     w._hs_last = None
     w._checking_handshake = False
     ran.clear()
-    w._check_handshake()
-    if ran:
-        fn, cb = ran[0]
-        cb(fn())
+    from PyQt5.QtWidgets import QMessageBox as _QMB
+    _orig_q2 = _QMB.question
+    prompted = []
+    _QMB.question = staticmethod(lambda *a, **k: prompted.append(1) or _QMB.No)
+    try:
+        w._check_handshake()
+        if ran:
+            fn, cb = ran[0]
+            cb(fn())
+    finally:
+        _QMB.question = _orig_q2
     check("有握手报成功", w._handshake_found
           and w.lbl_handshake.text().startswith("握手包"), w.lbl_handshake.text())
+    check("成功后自动停止抓包", not w._capture_running)
+    check("成功后提示是否加入右侧", len(prompted) == 1, str(len(prompted)))
     # 停止抓包后, 迟到的校验结果不能再报成功
     w._handshake_found = False
     w._capture_running = False
@@ -1597,23 +1607,130 @@ def main():
         cb(fn())
     check("停止后迟到结果不报成功", not w._handshake_found,
           str(w._handshake_found))
+
+    # 加入右侧破解列表(幂等)
+    n0 = w._current_result_tree().topLevelItemCount()
+    ok_add = w._add_cap_to_crack(_d2 / "UnitTestCap-01.cap")
+    check("握手包可加入右侧列表",
+          ok_add and w._current_result_tree().topLevelItemCount() == n0 + 1,
+          f"{n0}->{w._current_result_tree().topLevelItemCount()}")
+    check("重复加入被跳过", not w._add_cap_to_crack(_d2 / "UnitTestCap-01.cap"))
+
+    # 抓包期间客户端数量自动刷新
+    w._capture_running = True
+    w._cap_prefix = "UnitTestCap"
+    w.lbl_target_bssid.setText("AA:BB:CC:DD:EE:22")
+    (_d2 / "UnitTestCap-01.csv").write_text(
+        "Station MAC, First time seen, Last time seen, Power, # packets, "
+        "BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1, "
+        "AA:BB:CC:DD:EE:22,\r\n")
+    w.client_combo.clear()
+    w.client_combo.addItem("全部 (广播)", "")
+    w._refresh_capture_clients()
+    check("客户端数量自动刷新",
+          w.client_combo.count() == 2
+          and w.client_combo.itemData(1) == "0E:BE:B2:FD:94:88",
+          str([w.client_combo.itemData(i) for i in range(w.client_combo.count())]))
+    check("deauth 间隔改为 30 秒", w._DEAUTH_INTERVAL_MS == 30000,
+          str(w._DEAUTH_INTERVAL_MS))
+    w._capture_running = False
+    (_d2 / "UnitTestCap-01.csv").unlink(missing_ok=True)
     (_d2 / "UnitTestCap-01.cap").unlink(missing_ok=True)
+
+    # 全自动抓包: 只挑"有在线客户端"的 AP
+    _auto_fix = (
+        hdr + "\n"
+        "11:22:33:44:55:66, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -40, 4, 0,   0.  0.  0.  0, 3, AutoA, \n"
+        "22:33:44:55:66:77, 2026-10-05 10:00:00, 2026-10-05 10:00:01, 6, 130,"
+        " WPA2, AES, PSK, -70, 4, 0,   0.  0.  0.  0, 3, NoCli, \n"
+        "Station MAC, First time seen, Last time seen, Power, # packets, BSSID,"
+        " Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1,"
+        " 11:22:33:44:55:66,\r\n")
+    _apsec, _stsec = _auto_fix.split("Station MAC", 1)
+    _stations = w._parse_station_section("Station MAC" + _stsec)
+    _rows = w._parse_ap_csv(_apsec, _stations)
+    w._fill_ap_table(_rows)
+    _tg = w._auto_targets()
+    check("全自动仅挑有客户端的 AP",
+          len(_tg) == 1 and _tg[0]["essid"] == "AutoA", str(_tg))
+    w._auto_mode = True
+    w._auto_total = 3
+    w._capture_running = False
+    w._stop_auto_capture(quiet=True)
+    check("停止全自动后复位",
+          not w._auto_mode and w.btn_auto_cap.text().startswith("⚡"),
+          w.btn_auto_cap.text())
+
+    # 开始破解: 未选目标时用握手包元信息, 不再出现"未选择"; 密码列初始为空
+    w.lbl_target_essid.setText("未选择")
+    w.lbl_target_bssid.setText("未选择")
+    _cap3 = _d2 / "MetaCap-01.cap"
+    _cap3.write_bytes(b"x")
+    w.core.set_cap_meta(_cap3, {"essid": "MetaWiFi",
+                                "bssid": "AB:CD:EF:00:11:22"})
+    _orig_wl = w.core.get_wordlists
+    w.core.get_wordlists = lambda: ["/tmp/words.txt"]
+    w.cap_tree.clearSelection()
+    w.core.get_latest_handshake = lambda: _cap3
+    w._run_hashcat = lambda cap, wl: None
+    _n1 = w._current_result_tree().topLevelItemCount()
+    import importlib as _il
+    _il.import_module("main").EasyAirApp._start_crack(w)
+    _tree_r = w._current_result_tree()
+    _it = _tree_r.topLevelItem(_n1)
+    check("开始破解不再显示'未选择'",
+          _it.text(U.CrackResultWidget.COL_ESSID) == "MetaWiFi",
+          _it.text(U.CrackResultWidget.COL_ESSID))
+    check("密码列初始为空",
+          _it.text(U.CrackResultWidget.COL_PWD) == "",
+          repr(_it.text(U.CrackResultWidget.COL_PWD)))
+    w._crack_running = False
+    w.crack_timer.stop()
+    w.core.get_wordlists = _orig_wl
+    _cap3.unlink(missing_ok=True)
 
     section("界面按钮完整可用")
     check("抓包按钮在布局中", w.isAncestorOf(w.btn_capture),
           str(w.btn_capture.parent()))
+    check("全自动抓包按钮在布局中", w.isAncestorOf(w.btn_auto_cap),
+          str(w.btn_auto_cap.parent()))
+    check("加入右侧按钮存在", hasattr(w, "btn_cap_add"))
     check("导入握手包按钮存在且已接入",
           hasattr(w, "btn_import_cap")
           and hasattr(w.btn_import_cap, "clicked"), "btn_import_cap")
     check("客户端下拉存在", hasattr(w, "client_combo"))
     check("默认 deauth 为广播(空)", w._selected_client() == "",
           repr(w._selected_client()))
-    for name in ("btn_scan", "btn_capture", "btn_start_crack",
+    for name in ("btn_scan", "btn_capture", "btn_auto_cap", "btn_start_crack",
                  "btn_batch_add", "btn_import_cap"):
         b = getattr(w, name, None)
         check(f"{name} 无彩色背景",
               b is not None and "background" not in (b.styleSheet() or ""),
               b.styleSheet() if b else "missing")
+
+    section("导出为 txt(横线分隔)")
+    from PyQt5.QtWidgets import QFileDialog as _QFD
+    _exp = tmp / "out_export.txt"
+    _orig_save = _QFD.getSaveFileName
+    _orig_info = _QMB.information
+    _QFD.getSaveFileName = staticmethod(lambda *a, **k: (str(_exp), "txt"))
+    _QMB.information = staticmethod(lambda *a, **k: _QMB.Ok)
+    try:
+        w.core.history_add(today, {
+            "bssid": "AA:BB:CC:DD:EE:FF", "essid": "ExpWiFi",
+            "password": "pass123", "cap": "x.cap",
+            "status": "成功", "elapsed": "00:01", "note": "n"})
+        w._export_results()
+    finally:
+        _QFD.getSaveFileName = _orig_save
+        _QMB.information = _orig_info
+    _content = _exp.read_text(encoding="utf-8") if _exp.exists() else ""
+    check("导出使用横线分隔", "－" * 10 in _content, _content[:60])
+    check("导出含 WiFi 名称", "ExpWiFi" in _content, _content[:80])
+    check("导出含密码", "pass123" in _content, _content[:160])
 
     section("关闭时清理线程")
     w2.close()

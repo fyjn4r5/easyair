@@ -196,6 +196,12 @@ class EasyAirApp(MainUI):
         self._handshake_found = False
         self._hs_last = None
         self._deauth_attempts = 0
+        self._auto_mode = False
+        self._auto_queue = []
+        self._auto_total = 0
+        self._auto_done = 0
+        self._auto_ok = 0
+        self._auto_deadline = None
 
         # 破解相关状态
         self.current_crack_item = None
@@ -267,6 +273,7 @@ class EasyAirApp(MainUI):
         # 扫描/抓包
         self.btn_scan.clicked.connect(self._toggle_scan)
         self.btn_capture.clicked.connect(self._toggle_capture)
+        self.btn_auto_cap.clicked.connect(self._toggle_auto_capture)
 
         # 字典管理
         self.btn_dict_mgr.clicked.connect(self._open_dict_manager)
@@ -277,6 +284,7 @@ class EasyAirApp(MainUI):
         # 破解控制
         self.btn_start_crack.clicked.connect(self._toggle_crack)
         self.btn_batch_add.clicked.connect(self._batch_add_to_crack)
+        self.btn_cap_add.clicked.connect(self._batch_add_to_crack)
         self.btn_import_cap.clicked.connect(self._import_handshakes)
         self.btn_copy_wifi.clicked.connect(self._copy_wifi_credentials)
         self.cap_tree.customContextMenuRequested.connect(self._cap_menu)
@@ -360,6 +368,9 @@ class EasyAirApp(MainUI):
     # 扫描多久还没有 AP 就主动诊断(airodump-ng 抓到 0 个 AP 时不会退出)
     _NO_APS_TIMEOUT = 15
 
+    # deauth 重发间隔(毫秒): 30 秒, 留间隔避免被 AP 拉黑
+    _DEAUTH_INTERVAL_MS = 30000
+
     # 真实报错关键词: 命中即绕过噪音过滤, 保证用户能看到失败原因
     _ERROR_KEYWORDS = (
         "not found", "no such file", "permission denied",
@@ -404,7 +415,8 @@ class EasyAirApp(MainUI):
 
     def _append_log(self, kind: str, txt: str):
         box = self.log_crack_box if kind == "crack" else self.log_scan_box
-        box.appendPlainText(txt)
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        box.appendPlainText(f"[{stamp}] {txt}")
 
     def log(self, txt: str):
         """抓包/扫描日志 (只收有意义的内容)"""
@@ -680,11 +692,15 @@ class EasyAirApp(MainUI):
             self.cap_tree.clearSelection()
             item.setSelected(True)
         menu = QMenu(self)
+        act_add = menu.addAction("➕ 加入右侧破解")
         act_del = menu.addAction("🗑 删除选中")
         act_clear = menu.addAction("🧹 清空全部")
         act_note = menu.addAction("📝 编辑备注")
         chosen = menu.exec_(self.cap_tree.viewport().mapToGlobal(pos))
         if chosen is None:
+            return
+        if chosen == act_add:
+            self._batch_add_to_crack()
             return
         if chosen == act_note:
             if item:
@@ -1042,6 +1058,15 @@ class EasyAirApp(MainUI):
         if not physical:
             self.set_status("请先在顶部选择无线网卡")
             return
+
+        # 重新扫描前先停掉正在进行的抓包/全自动抓包, 避免同一网卡被
+        # 抓包进程占着导致扫描接口冲突
+        if getattr(self, "_auto_mode", False):
+            self.log("[扫描] 先停止全自动抓包")
+            self._stop_auto_capture(quiet=True)
+        elif getattr(self, "_capture_running", False):
+            self.log("[扫描] 先停止正在进行的抓包")
+            self._stop_capture(quiet=True)
 
         if not self._preflight_scan():
             return
@@ -1637,6 +1662,9 @@ class EasyAirApp(MainUI):
 
     def _toggle_capture(self):
         """开始抓包/停止抓包合并为一个按钮。"""
+        if getattr(self, "_auto_mode", False):
+            self._stop_auto_capture()
+            return
         if getattr(self, "_capture_running", False):
             self._stop_capture()
         else:
@@ -1712,11 +1740,18 @@ class EasyAirApp(MainUI):
         self.cap_check_timer.setInterval(2000)
         self.cap_check_timer.start()
 
-        # 没抓到就每 5s 重发一次 deauth, 直到抓到或停止
+        # 没抓到就每隔 30s 重发一次 deauth(像 minidwep 那样留出间隔,
+        # 避免短时间内狂发 deauth 被路由器/AP 拉黑锁死), 直到抓到或停止
         self.deauth_retry_timer = QTimer(self)
         self.deauth_retry_timer.timeout.connect(self._retry_deauth)
-        self.deauth_retry_timer.setInterval(5000)
+        self.deauth_retry_timer.setInterval(self._DEAUTH_INTERVAL_MS)
         self.deauth_retry_timer.start()
+
+        # 抓包期间每隔几秒刷新一次在线客户端数量/列表(下拉可定向)
+        self.client_refresh_timer = QTimer(self)
+        self.client_refresh_timer.timeout.connect(self._refresh_capture_clients)
+        self.client_refresh_timer.setInterval(5000)
+        self.client_refresh_timer.start()
 
     def _on_capture_started(self, p):
         if not p:
@@ -1746,6 +1781,17 @@ class EasyAirApp(MainUI):
         """轮询本次抓包文件, 用 has_handshake 真校验 EAPOL, 而非看文件存在。"""
         if getattr(self, "_checking_handshake", False) or \
                 getattr(self, "_handshake_found", False):
+            return
+        # 全自动模式: 单个目标超时未抓到就跳到下一个, 不无限等待
+        if getattr(self, "_auto_mode", False) and self._auto_deadline \
+                and time.time() > self._auto_deadline \
+                and not getattr(self, "_handshake_found", False):
+            self.log(f"[全自动] ({self._auto_done + 1}/{self._auto_total}) "
+                     f"超时未捕获握手，跳到下一个")
+            self._auto_done += 1
+            self._auto_deadline = None
+            self._stop_capture(quiet=True)
+            QTimer.singleShot(800, self._auto_next)
             return
         pref = getattr(self, "_cap_prefix", "")
         if not pref:
@@ -1786,14 +1832,111 @@ class EasyAirApp(MainUI):
         self.log(f"[成功] 已校验到真实握手包 → {cap.name}")
         self.bottom_tabs.setCurrentWidget(self.log_scan_box)
         self._refresh_cap_tree()
-        self.set_status("握手包已捕获 · 可开始破解")
+        self.set_status("握手包已捕获 · 抓包已自动停止")
+        # 抓到即自动停止抓包
         self._stop_capture_timers()
         self._capture_running = False
         self._set_capture_btn(False)
         self._kill_capture()
+        if getattr(self, "_auto_mode", False):
+            self._auto_on_target_done(cap)
+        else:
+            self._prompt_add_after_capture(cap)
+
+    def _prompt_add_after_capture(self, cap):
+        """手动抓包成功后提示是否加入右侧破解列表。"""
+        cap = Path(cap)
+        ans = QMessageBox.question(
+            self, "握手包已捕获",
+            f"已捕获并校验到 {cap.name} 的真实握手包。\n"
+            f"是否加入右侧破解列表进行跑包？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ans == QMessageBox.Yes:
+            if self._add_cap_to_crack(cap):
+                self.log(f"[抓包] 已加入右侧破解列表: {cap.name}")
+                self.set_status("已加入右侧破解列表 · 可点「开始破解」")
+        else:
+            self.set_status("握手包已保存到握手包库 · 可稍后手动加入")
+
+    def _add_cap_to_crack(self, cap, essid=None, bssid=None) -> bool:
+        """把一个握手包加入右侧破解列表(已存在则跳过)。"""
+        tree = self._current_result_tree()
+        if tree is None:
+            return False
+        cap = Path(cap)
+        existing = {tree.topLevelItem(i).text(tree.COL_CAP)
+                    for i in range(tree.topLevelItemCount())}
+        if str(cap) in existing:
+            return False
+        meta = self.core.cap_meta(cap)
+        essid = essid or meta.get("essid") or cap.stem
+        bssid = bssid or meta.get("bssid") or "-"
+        note = self.core.cap_note(cap)
+        item = tree.add_target(bssid, essid, str(cap), note)
+        self.current_crack_date = self._tab_date()
+        self.core.history_add(self.current_crack_date, tree.to_record(item))
+        idx = self.result_tabs.currentIndex()
+        if idx >= 0:
+            self.result_tabs.setTabText(
+                idx, f"{self.current_crack_date} ({tree.topLevelItemCount()})")
+        return True
+
+    def _refresh_capture_clients(self):
+        """抓包期间周期刷新目标 AP 的在线客户端数量与下拉列表。"""
+        if not getattr(self, "_capture_running", False):
+            return
+        pref = getattr(self, "_cap_prefix", "")
+        bssid = self.lbl_target_bssid.text().upper()
+        if not pref or not bssid:
+            return
+        try:
+            csvs = [c for c in self.core._dated_dir().glob(pref + "*.csv")
+                    if c.is_file()]
+        except OSError:
+            return
+        if not csvs:
+            return
+        csvf = max(csvs, key=lambda x: x.stat().st_mtime)
+        try:
+            txt = csvf.read_text(errors="ignore", encoding="utf-8")
+        except OSError:
+            return
+        if "Station MAC" not in txt:
+            return
+        station_sec = txt.split("Station MAC", 1)[1]
+        stations = self._parse_station_section(station_sec)
+        macs = [c["mac"] for c in stations.get(bssid, [])]
+        self._ap_clients[bssid] = macs
+        combo = getattr(self, "client_combo", None)
+        if combo is None:
+            return
+        shown = [combo.itemData(i) for i in range(1, combo.count())]
+        if set(shown) == set(macs):
+            return
+        keep = self._selected_client()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("全部 (广播)", "")
+        for m in macs:
+            combo.addItem(m, m)
+        if keep:
+            i = combo.findData(keep)
+            combo.setCurrentIndex(i if i >= 0 else 0)
+        combo.blockSignals(False)
+        self.log(f"[客户端] {bssid} 在线客户端更新为 {len(macs)} 个")
+
+    def _auto_on_target_done(self, cap):
+        """全自动模式: 记录本次成功, 然后抓下一个。"""
+        self._auto_done += 1
+        if self._add_cap_to_crack(cap):
+            self._auto_ok += 1
+            self.log(f"[全自动] ({self._auto_done}/{self._auto_total}) "
+                     f"已加入 {Path(cap).name}")
+        QTimer.singleShot(1200, self._auto_next)
 
     def _stop_capture_timers(self):
-        for name in ("cap_check_timer", "deauth_retry_timer"):
+        for name in ("cap_check_timer", "deauth_retry_timer",
+                     "client_refresh_timer"):
             t = getattr(self, name, None)
             if t is not None and t.isActive():
                 try:
@@ -1812,7 +1955,7 @@ class EasyAirApp(MainUI):
         self.btn_capture.setText("⏸ 停止抓包" if running else "📡 抓握手包")
         self.btn_capture.setStyleSheet("font-weight: bold;")
 
-    def _stop_capture(self):
+    def _stop_capture(self, quiet: bool = False):
         self._capture_running = False
         self._stop_capture_timers()
         if getattr(self, 'cap_thread', None):
@@ -1823,10 +1966,110 @@ class EasyAirApp(MainUI):
             self.cap_thread = None
         self._kill_capture()
         self._set_capture_btn(False)
+        if not getattr(self, "_handshake_found", False):
+            self.lbl_handshake.setText("未捕获")
+            self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
+        if not quiet:
+            self.set_status("已停止抓包")
+            self.log("[抓包] 已停止抓包")
+
+    # ===== 全自动抓包(依次抓取所有有客户端的 AP) =====
+    _AUTO_PER_TARGET_SECS = 90
+
+    def _toggle_auto_capture(self):
+        if getattr(self, "_auto_mode", False):
+            self._stop_auto_capture()
+        else:
+            self._start_auto_capture()
+
+    def _auto_targets(self) -> list:
+        """从当前 AP 表里取所有有在线客户端的目标(按表格当前排序)。"""
+        out = []
+        for r in range(self.ap_table.rowCount()):
+            def cell(c):
+                it = self.ap_table.item(r, c)
+                return it.text() if it else ""
+            try:
+                n = int(cell(2))
+            except (TypeError, ValueError):
+                n = 0
+            if n <= 0:
+                continue
+            bssid = cell(4)
+            if not bssid:
+                continue
+            out.append({"essid": cell(1), "bssid": bssid,
+                        "ch": cell(5), "clients": self._ap_clients.get(
+                            bssid.upper(), [])})
+        return out
+
+    def _start_auto_capture(self):
+        if getattr(self, "_capture_running", False):
+            self._stop_capture(quiet=True)
+        targets = self._auto_targets()
+        if not targets:
+            QMessageBox.information(
+                self, "提示",
+                "当前没有发现「有在线客户端」的 AP。\n"
+                "请先点「扫描」，待列表出现带客户端的 AP 后再用全自动抓包。")
+            return
+        self._auto_queue = targets
+        self._auto_total = len(targets)
+        self._auto_done = 0
+        self._auto_ok = 0
+        self._auto_mode = True
+        self._set_auto_btn(True)
+        self.log(f"[全自动] 共 {self._auto_total} 个有客户端的 AP，开始依次抓包")
+        self._auto_next()
+
+    def _auto_next(self):
+        if not getattr(self, "_auto_mode", False):
+            return
+        if not self._auto_queue:
+            self._finish_auto()
+            return
+        tgt = self._auto_queue.pop(0)
+        self.lbl_target_essid.setText(tgt["essid"])
+        self.lbl_target_bssid.setText(tgt["bssid"])
+        self.lbl_target_ch.setText(tgt.get("ch") or "--")
         self.lbl_handshake.setText("未捕获")
         self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
-        self.set_status("已停止抓包")
-        self.log("[抓包] 已停止抓包")
+        if hasattr(self, "client_combo"):
+            self.client_combo.clear()
+            self.client_combo.addItem("全部 (广播)", "")
+            for mac in self._ap_clients.get(tgt["bssid"].upper(), []):
+                self.client_combo.addItem(mac, mac)
+        self.log(f"[全自动] ({self._auto_done + 1}/{self._auto_total}) "
+                 f"抓取 {tgt['essid']} ({tgt['bssid']})")
+        self._auto_deadline = time.time() + self._AUTO_PER_TARGET_SECS
+        self._start_capture()
+
+    def _stop_auto_capture(self, quiet: bool = False):
+        self._auto_mode = False
+        self._auto_queue = []
+        self._auto_deadline = None
+        self._set_auto_btn(False)
+        if getattr(self, "_capture_running", False):
+            self._stop_capture(quiet=quiet)
+        if not quiet:
+            self.log(f"[全自动] 已停止 (成功 {self._auto_ok}/{self._auto_total})")
+            self.set_status("已停止全自动抓包")
+
+    def _set_auto_btn(self, running: bool):
+        if not hasattr(self, "btn_auto_cap"):
+            return
+        self.btn_auto_cap.setText("⏹ 停止全自动" if running else "⚡ 全自动抓包")
+        self.btn_auto_cap.setStyleSheet("font-weight: bold;")
+
+    def _finish_auto(self):
+        self._auto_mode = False
+        self._auto_queue = []
+        self._auto_deadline = None
+        self._set_auto_btn(False)
+        self.log(f"[全自动] 完成: 成功捕获 {self._auto_ok}/{self._auto_total} 个握手包")
+        self.set_status(
+            f"全自动抓包完成 · 成功 {self._auto_ok}/{self._auto_total}"
+            + (" · 可点「开始破解」" if self._auto_ok else ""))
 
     def _auto_stop_monitor(self):
         if self.auto_monitor_enabled and self.mon_iface:
@@ -1867,6 +2110,13 @@ class EasyAirApp(MainUI):
 
         essid = self.lbl_target_essid.text()
         bssid = self.lbl_target_bssid.text()
+        # 没在左侧选中 AP 时不要写成"未选择": 用握手包自带的元信息
+        # (抓包时记下的 SSID/BSSID) 兜底, 否则右侧会多出一行无意义的"未选择"
+        meta = self.core.cap_meta(Path(cap))
+        if not essid or essid == "未选择":
+            essid = meta.get("essid") or Path(cap).stem
+        if not bssid or bssid == "未选择":
+            bssid = meta.get("bssid") or "-"
 
         tree = self._current_result_tree()
         self.current_crack_date = self._tab_date()
@@ -2083,27 +2333,44 @@ class EasyAirApp(MainUI):
     def _export_results(self):
         fn, _ = QFileDialog.getSaveFileName(
             self, "导出结果",
-            str(Path.home() / "easyair_results.csv"), "CSV Files (*.csv)")
+            str(Path.home() / "easyair_results.txt"), "文本文件 (*.txt)")
         if not fn:
             return
+        if not fn.lower().endswith(".txt"):
+            fn += ".txt"
+        sep = "－" * 40
+        rows = []
+        for date in self.core.history_dates():
+            for rec in self.core.history_records(date):
+                pwd = (rec.get("password") or "").strip()
+                if pwd == "破解中...":
+                    pwd = ""
+                rows.append((date, rec, pwd))
+        if not rows:
+            QMessageBox.information(self, "提示", "没有可导出的记录")
+            return
         try:
-            with open(fn, 'w', encoding='utf-8', newline='') as f:
-                f.write("日期,BSSID,SSID,密码,握手包,状态,耗时,备注\n")
-                for date in self.core.history_dates():
-                    for rec in self.core.history_records(date):
-                        f.write(",".join([
-                            date, rec.get("bssid", ""), rec.get("essid", ""),
-                            rec.get("password", ""), rec.get("cap", ""),
-                            rec.get("status", ""), rec.get("elapsed", ""),
-                            f'"{rec.get("note", "")}"',
-                        ]) + "\n")
-            QMessageBox.information(self, "成功", f"已导出到: {fn}")
-            self.log(f"[导出] 结果已保存到: {fn}")
+            with open(fn, 'w', encoding='utf-8') as f:
+                for date, rec, pwd in rows:
+                    f.write(sep + "\n")
+                    f.write(f"WiFi名称: {rec.get('essid') or '(未知)'}\n")
+                    f.write(f"BSSID:   {rec.get('bssid') or '-'}\n")
+                    f.write(f"密码:     {pwd or '(未破解)'}\n")
+                    f.write(f"状态:     {rec.get('status') or ''}\n")
+                    f.write(f"日期:     {date}\n")
+                    note = (rec.get("note") or "").strip()
+                    if note:
+                        f.write(f"备注:     {note}\n")
+                f.write(sep + "\n")
+            n_ok = sum(1 for _, _, p in rows if p and p not in ("未找到", "已停止"))
+            QMessageBox.information(
+                self, "成功", f"已导出 {len(rows)} 条记录到:\n{fn}")
+            self.log(f"[导出] 已导出 {len(rows)} 条记录(含密码 {n_ok} 条)到: {fn}")
         except OSError as e:
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.13.1"
+VERSION = "1.15.0"
 
 
 def _selftest() -> int:
