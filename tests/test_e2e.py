@@ -935,7 +935,7 @@ def main():
     check("复制后有状态提示", "已复制" in w.status_label.text(),
           w.status_label.text())
 
-    section("本轮: 单击选目标即抓包/ 排序 / 提示去重")
+    section("本轮: 单击选目标/双击抓包 / 排序 / 提示去重")
     # 双击可触发抓包
     check("双击绑定已启用", hasattr(w.ap_table, "cellDoubleClicked")
           and hasattr(w.ap_table.cellDoubleClicked, "connect"), "double click enabled")
@@ -962,10 +962,15 @@ def main():
 
     w.ap_table.setCurrentCell(0, 0)
     w._on_ap_clicked(0, 0)
-    check("单击触发抓包", sigs == ["capture"], str(sigs))
+    check("单击仅选目标不抓包", sigs == [], str(sigs))
     check("目标已填", w.lbl_target_bssid.text() == "AA:BB:CC:DD:EE:22",
           w.lbl_target_bssid.text())
-    check("单击选目标返回 True", w._select_target(0) is True)
+    w._on_ap_double_clicked(0, 0)
+    check("双击触发抓包", sigs == ["capture"], str(sigs))
+    check("客户端下拉存在且有广播项",
+          hasattr(w, "client_combo") and w.client_combo.count() >= 1,
+          str(getattr(w, "client_combo", None)))
+    check("单击不抓包返回 True", w._select_target(0) is True)
     check("行-1 返回 False", w._select_target(-1) is False)
 
     check("提示不再重复出现'扫描中'",
@@ -1544,6 +1549,71 @@ def main():
           _pk.get("2026-01-01") is not None, str(_pk))
     for _n in ("MyHomeWiFi-01.cap", "Cafe-01.cap", "random.pcap"):
         (_d / _n).unlink()
+
+    section("抓包握手真校验: 文件存在 != 抓到握手")
+    w._cap_prefix = "UnitTestCap"
+    _d2 = w.core._dated_dir()
+    (_d2 / "UnitTestCap-01.cap").write_bytes(b"not-a-real-cap")
+    ran = []
+    w._run_worker = lambda fn, on_done=None: ran.append((fn, on_done))
+    w.core.has_handshake = lambda cap: False
+    w._checking_handshake = False
+    w._handshake_found = False
+    w._capture_running = True
+    w._hs_last = None
+    w._check_handshake()
+    check("提交了一次握手校验", len(ran) == 1, str(len(ran)))
+    if ran:
+        fn, cb = ran[0]
+        cb(fn())
+    check("无握手不报成功",
+          not w._handshake_found
+          and not w.lbl_handshake.text().startswith("握手包"),
+          w.lbl_handshake.text())
+    # 同样文件、内容不变时不应重复解析
+    ran.clear()
+    w._check_handshake()
+    check("文件未变化不重复校验", len(ran) == 0, str(len(ran)))
+    # 真含握手才报成功
+    w.core.has_handshake = lambda cap: True
+    w._hs_last = None
+    w._checking_handshake = False
+    ran.clear()
+    w._check_handshake()
+    if ran:
+        fn, cb = ran[0]
+        cb(fn())
+    check("有握手报成功", w._handshake_found
+          and w.lbl_handshake.text().startswith("握手包"), w.lbl_handshake.text())
+    # 停止抓包后, 迟到的校验结果不能再报成功
+    w._handshake_found = False
+    w._capture_running = False
+    w._hs_last = None
+    w._checking_handshake = False
+    ran.clear()
+    w._check_handshake()
+    if ran:
+        fn, cb = ran[0]
+        cb(fn())
+    check("停止后迟到结果不报成功", not w._handshake_found,
+          str(w._handshake_found))
+    (_d2 / "UnitTestCap-01.cap").unlink(missing_ok=True)
+
+    section("界面按钮完整可用")
+    check("抓包按钮在布局中", w.isAncestorOf(w.btn_capture),
+          str(w.btn_capture.parent()))
+    check("导入握手包按钮存在且已接入",
+          hasattr(w, "btn_import_cap")
+          and hasattr(w.btn_import_cap, "clicked"), "btn_import_cap")
+    check("客户端下拉存在", hasattr(w, "client_combo"))
+    check("默认 deauth 为广播(空)", w._selected_client() == "",
+          repr(w._selected_client()))
+    for name in ("btn_scan", "btn_capture", "btn_start_crack",
+                 "btn_batch_add", "btn_import_cap"):
+        b = getattr(w, name, None)
+        check(f"{name} 无彩色背景",
+              b is not None and "background" not in (b.styleSheet() or ""),
+              b.styleSheet() if b else "missing")
 
     section("关闭时清理线程")
     w2.close()

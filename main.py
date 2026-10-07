@@ -190,6 +190,12 @@ class EasyAirApp(MainUI):
         self._capture_running = False
         self._scan_warned = False
         self.scan_returncode = None
+        self._client_tips = {}
+        self._ap_clients = {}
+        self._checking_handshake = False
+        self._handshake_found = False
+        self._hs_last = None
+        self._deauth_attempts = 0
 
         # 破解相关状态
         self.current_crack_item = None
@@ -271,6 +277,7 @@ class EasyAirApp(MainUI):
         # 破解控制
         self.btn_start_crack.clicked.connect(self._toggle_crack)
         self.btn_batch_add.clicked.connect(self._batch_add_to_crack)
+        self.btn_import_cap.clicked.connect(self._import_handshakes)
         self.btn_copy_wifi.clicked.connect(self._copy_wifi_credentials)
         self.cap_tree.customContextMenuRequested.connect(self._cap_menu)
         self.cap_tree.itemChanged.connect(self._on_cap_note_edited)
@@ -797,6 +804,54 @@ class EasyAirApp(MainUI):
         self._persist_record()
         self.set_status(f"已批量加入 {added} 个握手包到右侧列表")
         self.log(f"[批量] 已加入 {added} 个握手包")
+
+    def _import_handshakes(self):
+        """从外部导入 1 个或多个握手包。
+
+        复制进当天握手包库(便于留存), 校验确含握手后加入右侧破解列表。"""
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "导入握手包", str(Path.home()),
+            "握手包 (*.cap *.pcap *.22000);;所有文件 (*.*)")
+        if not files:
+            return
+        dest_dir = self.core._dated_dir()
+        tree = self._current_result_tree()
+        existing = set()
+        if tree is not None:
+            for i in range(tree.topLevelItemCount()):
+                existing.add(tree.topLevelItem(i).text(tree.COL_CAP))
+        added = bad = 0
+        for f in files:
+            src = Path(f)
+            if not src.is_file():
+                continue
+            if src.suffix.lower() in (".cap", ".pcap") \
+                    and not self.core.has_handshake(src):
+                bad += 1
+                self.log(f"[导入] {src.name} 未检出握手包，已跳过")
+                continue
+            dest = dest_dir / src.name
+            if dest.exists():
+                dest = dest_dir / f"{src.stem}-import{src.suffix}"
+            try:
+                shutil.copy2(src, dest)
+            except OSError as e:
+                self.log(f"[导入失败] {src.name}: {e}")
+                continue
+            if tree is not None and str(dest) not in existing:
+                tree.add_target("-", src.stem, str(dest), "")
+                existing.add(str(dest))
+            added += 1
+        self._refresh_cap_tree()
+        if tree is not None:
+            idx = self.result_tabs.currentIndex()
+            if idx >= 0:
+                self.result_tabs.setTabText(
+                    idx, f"{self._tab_date(idx)} ({tree.topLevelItemCount()})")
+            self._persist_record()
+        msg = f"已导入 {added} 个握手包" + (f"，跳过 {bad} 个(不含握手)" if bad else "")
+        self.set_status(msg)
+        self.log(f"[导入] {msg}")
 
     def _copy_wifi_credentials(self):
         """复制选中记录的 WiFi 名称与密码, 无密码时不可用。"""
@@ -1411,6 +1466,7 @@ class EasyAirApp(MainUI):
         rows = []
         hidden_count = 0
         self._client_tips = {}
+        self._ap_clients = {}
         # airodump 的分隔符是 ", "，引号前多一个空格会使 CSV 规范失效，
         # 含逗号的 SSID(如 "Cafe, Guest") 会被切成两列。先归一化再解析。
         txt = re.sub(r",\s+(?=\")", ",", txt)
@@ -1474,6 +1530,7 @@ class EasyAirApp(MainUI):
             # 客户端信息: 第 8 列(真实存在于 airodump CSV 的 Station 段)
             clients = stations_by_bssid.get(bssid.upper(), []) if stations_by_bssid else []
             client_count = len(clients)
+            self._ap_clients[bssid.upper()] = [c["mac"] for c in clients]
             client_str = f"{client_count} 客户端"
             if client_count:
                 # 列窄, 只显示数量; MAC 明细放 tooltip
@@ -1517,14 +1574,13 @@ class EasyAirApp(MainUI):
         return "█░░░░", "#c62828"
 
     def _on_ap_clicked(self, row, col):
-        """单击设为目标。"""
-        if not self._select_target(row):
-            return
-        self._toggle_capture()
+        """单击只设为目标, 不抓包 —— 避免误点就长时间占用网卡。"""
+        self._select_target(row)
 
     def _on_ap_double_clicked(self, row, col):
         """双击设为目标并开始/停止抓包。"""
-        self._select_target(row)
+        if not self._select_target(row):
+            return
         self._toggle_capture()
 
     def _select_target(self, row):
@@ -1545,10 +1601,24 @@ class EasyAirApp(MainUI):
         self.lbl_target_enc.setText(enc)
         self.lbl_handshake.setText("未捕获")
         self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
-        
+        # 客户端下拉: 默认广播 deauth, 也可定向某个在线客户端
+        if hasattr(self, "client_combo"):
+            self.client_combo.clear()
+            self.client_combo.addItem("全部 (广播)", "")
+            for mac in getattr(self, "_ap_clients", {}).get(bssid.upper(), []):
+                self.client_combo.addItem(mac, mac)
+
         self.log(f"[目标] 已选择: {essid} ({bssid}) CH:{ch}")
         self.set_status(f"目标已锁定: {essid}")
         return True
+
+    def _selected_client(self) -> str:
+        """当前选中的定向客户端 MAC, 空串表示广播。"""
+        if hasattr(self, "client_combo"):
+            data = self.client_combo.currentData()
+            if data:
+                return str(data)
+        return ""
 
     # ===== 抓包 =====
     def _toggle_scan(self):
@@ -1598,6 +1668,10 @@ class EasyAirApp(MainUI):
         cap_prefix = self.core.safe_cap_prefix(essid, bssid)
         self._cap_prefix = cap_prefix
 
+        cap_prefix = self.core.safe_cap_prefix(essid, bssid)
+        self._cap_prefix = cap_prefix
+        client = self._selected_client()
+
         def _capture():
             proc = self.core.airodump_capture(
                 self.mon_iface, bssid, ch, cap_prefix)
@@ -1612,81 +1686,145 @@ class EasyAirApp(MainUI):
                 if f.name.startswith(cap_prefix):
                     self.core.set_cap_meta(
                         f, {"essid": essid, "bssid": bssid, "channel": ch})
-            # 等 airodump 完成握手再发 deauth
+            # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
+            # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL。
+            # 等 airodump 起稳后再发第一次 deauth, 之后由定时器自动重试。
             time.sleep(2.0)
-            dp = self.core.deauth(self.mon_iface, bssid, 10)
+            dp = self.core.deauth(self.mon_iface, bssid, 10, client)
             if dp:
-                self.log(f"[deauth] 已自动发送 10 次解关联 → {bssid}")
+                self.log(f"[deauth] 已发送 10 次解关联 → {bssid}"
+                         + (f" (定向 {client})" if client else " (广播)"))
             else:
                 self.log("[deauth] 发送失败, 可能抓不到握手包")
             return proc
 
         self._capture_running = True
-        if hasattr(self, 'btn_capture'):
-            self.btn_capture.setText("⏸ 停止抓包")
-            self.btn_capture.setStyleSheet("font-weight: bold; background: #c62828; color: white;")
+        self._handshake_found = False
+        self._checking_handshake = False
+        self._hs_last = None
+        self._deauth_attempts = 1
+        self._set_capture_btn(True)
         self._run_worker(_capture, self._on_capture_started)
 
+        # 每 2s 校验一次抓到的包是否真含握手, 直到抓到或用户停止
         self.cap_check_timer = QTimer(self)
         self.cap_check_timer.timeout.connect(self._check_handshake)
         self.cap_check_timer.setInterval(2000)
         self.cap_check_timer.start()
 
+        # 没抓到就每 5s 重发一次 deauth, 直到抓到或停止
+        self.deauth_retry_timer = QTimer(self)
+        self.deauth_retry_timer.timeout.connect(self._retry_deauth)
+        self.deauth_retry_timer.setInterval(5000)
+        self.deauth_retry_timer.start()
+
     def _on_capture_started(self, p):
         if not p:
             self._capture_running = False
-            if hasattr(self, 'btn_capture'):
-                self.btn_capture.setText("📡 抓握手包")
-                self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+            self._stop_capture_timers()
+            self._set_capture_btn(False)
             self.set_status("抓包启动失败")
             return
         self.cap_thread = self._spawn_cmd(p, self.log_scan)
 
+    def _retry_deauth(self):
+        """抓不到握手就周期性重发 deauth, 直到成功或用户停止。"""
+        if not getattr(self, "_capture_running", False) or \
+                getattr(self, "_handshake_found", False):
+            return
+        bssid = self.lbl_target_bssid.text()
+        if not self.mon_iface or not bssid:
+            return
+        client = self._selected_client()
+        self._deauth_attempts += 1
+        self.log(f"[deauth] 尚未捕获握手, 第 {self._deauth_attempts} 次重发 → {bssid}"
+                 + (f" (定向 {client})" if client else " (广播)"))
+        self._run_worker(
+            lambda: self.core.deauth(self.mon_iface, bssid, 10, client), None)
+
     def _check_handshake(self):
-        cap = None
-        # 只认本次抓包产生的前缀, 否则历史遗留的 cap 会让"已捕获"提前
-        # 亮绿灯(实测这会让界面显示成功但文件其实是旧的)
+        """轮询本次抓包文件, 用 has_handshake 真校验 EAPOL, 而非看文件存在。"""
+        if getattr(self, "_checking_handshake", False) or \
+                getattr(self, "_handshake_found", False):
+            return
         pref = getattr(self, "_cap_prefix", "")
-        if pref:
-            same = [f for f in self.core._iter_caps(self.core._dated_dir())
-                    if f.name.startswith(pref)]
-            if same:
-                cap = max(same, key=lambda x: x.stat().st_mtime)
-        if cap is None:
-            cap = self.core.get_latest_handshake()
-        if cap:
-            self.lbl_handshake.setText(f"握手包 {cap.name}")
-            self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
-            self.log(f"[成功] 已捕获握手包 → {cap.name}")
-            self.bottom_tabs.setCurrentWidget(self.log_scan_box)
-            self._refresh_cap_tree()
-            self.set_status(f"握手包已捕获 · 可开始破解")
-            if hasattr(self, 'cap_check_timer'):
+        if not pref:
+            return
+        same = [f for f in self.core._iter_caps(self.core._dated_dir())
+                if f.name.startswith(pref)]
+        if not same:
+            return
+        cap = max(same, key=lambda x: x.stat().st_mtime)
+        try:
+            size = cap.stat().st_size
+        except OSError:
+            return
+        # 文件没长过且校验过就没必要重复解析
+        if getattr(self, "_hs_last", None) == (str(cap), size):
+            return
+        self._hs_last = (str(cap), size)
+        self._checking_handshake = True
+        self._run_worker(lambda: self.core.has_handshake(cap),
+                         lambda ok: self._on_handshake_checked(cap, ok))
+
+    def _on_handshake_checked(self, cap, ok):
+        self._checking_handshake = False
+        if getattr(self, "_handshake_found", False):
+            return
+        # 用户已停抓包后, 迟到的校验结果不能再报成功
+        if not getattr(self, "_capture_running", False):
+            return
+        if not ok:
+            # 关键: 文件存在 != 抓到握手。没真握手就不报成功
+            self.lbl_handshake.setText("等待握手…")
+            self.lbl_handshake.setStyleSheet("color: #f57c00; font-weight: bold;")
+            self.set_status("抓包中 · 尚未捕获到握手，正在自动重发 deauth…")
+            return
+        self._handshake_found = True
+        self.lbl_handshake.setText(f"握手包 {cap.name}")
+        self.lbl_handshake.setStyleSheet("color: #2e7d32; font-weight: bold;")
+        self.log(f"[成功] 已校验到真实握手包 → {cap.name}")
+        self.bottom_tabs.setCurrentWidget(self.log_scan_box)
+        self._refresh_cap_tree()
+        self.set_status("握手包已捕获 · 可开始破解")
+        self._stop_capture_timers()
+        self._capture_running = False
+        self._set_capture_btn(False)
+        self._kill_capture()
+
+    def _stop_capture_timers(self):
+        for name in ("cap_check_timer", "deauth_retry_timer"):
+            t = getattr(self, name, None)
+            if t is not None and t.isActive():
                 try:
-                    self.cap_check_timer.stop()
+                    t.stop()
                 except Exception:
                     pass
-            self._capture_running = False
-            if hasattr(self, 'btn_capture'):
-                self.btn_capture.setText("📡 抓握手包")
-                self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+
+    def _kill_capture(self):
+        """杀掉后台的抓包 airodump(带 --background 会脱离父进程)。"""
+        pref = getattr(self, "_cap_prefix", "")
+        self._run_worker(lambda: self.core.kill_capture_processes(pref), None)
+
+    def _set_capture_btn(self, running: bool):
+        if not hasattr(self, "btn_capture"):
+            return
+        self.btn_capture.setText("⏸ 停止抓包" if running else "📡 抓握手包")
+        self.btn_capture.setStyleSheet("font-weight: bold;")
 
     def _stop_capture(self):
         self._capture_running = False
-        if hasattr(self, 'cap_check_timer') and self.cap_check_timer.isActive():
-            try:
-                self.cap_check_timer.stop()
-            except Exception:
-                pass
+        self._stop_capture_timers()
         if getattr(self, 'cap_thread', None):
             try:
                 self.cap_thread.stop()
             except Exception:
                 pass
             self.cap_thread = None
-        if hasattr(self, 'btn_capture'):
-            self.btn_capture.setText("📡 抓握手包")
-            self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+        self._kill_capture()
+        self._set_capture_btn(False)
+        self.lbl_handshake.setText("未捕获")
+        self.lbl_handshake.setStyleSheet("color: #c62828; font-weight: bold;")
         self.set_status("已停止抓包")
         self.log("[抓包] 已停止抓包")
 
@@ -1748,7 +1886,7 @@ class EasyAirApp(MainUI):
         self.btn_start_crack.setEnabled(True)
         self.btn_start_crack.setText("⏹ 停止破解")
         self.btn_start_crack.setStyleSheet(
-            "font-weight: bold; background: #c62828; color: white;")
+            "font-weight: bold;")
         self._crack_running = True
         self.crack_start_time = time.time()
         self.crack_timer.start()
@@ -1905,7 +2043,7 @@ class EasyAirApp(MainUI):
         self.btn_start_crack.setEnabled(True)
         self.btn_start_crack.setText("▶ 开始破解")
         self.btn_start_crack.setStyleSheet(
-            "font-weight: bold; background: #2e7d32; color: white;")
+            "font-weight: bold;")
         self._crack_running = False
 
         tree = getattr(self, 'current_crack_tree', None)
@@ -1933,7 +2071,7 @@ class EasyAirApp(MainUI):
         self.btn_start_crack.setEnabled(True)
         self.btn_start_crack.setText("▶ 开始破解")
         self.btn_start_crack.setStyleSheet(
-            "font-weight: bold; background: #2e7d32; color: white;")
+            "font-weight: bold;")
         self._crack_running = False
         tree = getattr(self, 'current_crack_tree', None)
         if tree and self.current_crack_item:
@@ -1965,7 +2103,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 
 
 def _selftest() -> int:

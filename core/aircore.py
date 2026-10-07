@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import shlex
+import tempfile
 import time
 import binascii
 from pathlib import Path
@@ -493,6 +494,29 @@ class AirCore:
         except (PermissionError, OSError, subprocess.TimeoutExpired):
             return False
 
+    def kill_capture_processes(self, prefix: str = "") -> bool:
+        """停掉后台抓包的 airodump-ng。
+
+        airodump 带 `--background` 时父进程会立刻退出, 停抓包时 terminate
+        那个早就退出的父进程毫无作用 —— 必须按命令行特征 pkill 真正的抓包
+        进程。只匹配 `-w <captures>/<日期>/<prefix>`, 不会误杀扫描。"""
+        if not shutil.which("pkill"):
+            return False
+        base = self._dated_dir() / prefix if prefix else self._dated_dir()
+        pat = f"^airodump-ng.*-w {re.escape(str(base))}"
+        if os.geteuid() == 0:
+            try:
+                return subprocess.run(["pkill", "-f", pat],
+                                      capture_output=True, timeout=10).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+        if not self._get_sudo_password():
+            return False
+        try:
+            return self._run_sudo(["pkill", "-f", pat]).returncode == 0
+        except (PermissionError, OSError, subprocess.TimeoutExpired):
+            return False
+
     def cap_meta(self, cap: Path) -> dict:
         """读取抓包时记录的 AP 信息(ESSID/BSSID/信道)。
 
@@ -574,9 +598,56 @@ class AirCore:
                f"--output-format pcap,csv{background_arg()} -w {outpath} {mon_iface}")
         return self.run_cmd(cmd, sudo=True)
 
-    def deauth(self, mon_iface: str, bssid: str, count: int = 10):
-        cmd = f"aireplay-ng --deauth {count} -a {bssid} {mon_iface}"
+    def deauth(self, mon_iface: str, bssid: str, count: int = 10, client: str = ""):
+        """发送 deauth 迫使客户端重连。
+
+        指定 client 时只定向踢该客户端, 否则广播。没有客户端在线时广播
+        deauth 也抓不到握手, 定向可减少对无关设备的干扰。"""
+        cli = f" -c {client}" if client else ""
+        cmd = f"aireplay-ng --deauth {count} -a {bssid}{cli} {mon_iface}"
         return self.run_cmd(cmd, sudo=True)
+
+    def has_handshake(self, cap_file) -> bool:
+        """校验 .cap/.pcap 里是否真的含 WPA/WPA2 四次握手(或 PMKID)。
+
+        之前只判断文件是否存在就报"已捕获", 而 airodump 一启动就会建出
+        .cap —— 于是没客户端也秒变成功, 是纯误报。这里用 hcxpcapngtool 把
+        握手提取成 hc22000, 输出非空才算真; 没有该工具时退回解析
+        aircrack-ng 的 "N handshake(s)" 输出。"""
+        p = Path(cap_file)
+        try:
+            if not p.is_file() or p.stat().st_size == 0:
+                return False
+        except OSError:
+            return False
+        if shutil.which("hcxpcapngtool"):
+            fd, tmp = tempfile.mkstemp(suffix=".22000")
+            os.close(fd)
+            try:
+                subprocess.run(["hcxpcapngtool", str(p), "-o", tmp],
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30)
+                if os.path.getsize(tmp) > 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if shutil.which("aircrack-ng"):
+            try:
+                r = subprocess.run(["aircrack-ng", str(p)],
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=30)
+                out = (r.stdout or "") + (r.stderr or "")
+                m = re.search(r"(\d+)\s+handshake", out, re.I)
+                if m and int(m.group(1)) > 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return False
 
     def crack_aircrack(self, cap_file: str, wordlist: str):
         cmd = f"aircrack-ng '{cap_file}' -w '{wordlist}'"

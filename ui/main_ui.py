@@ -405,6 +405,17 @@ class MainUI(QWidget):
         tgt_layout.addWidget(self.lbl_handshake)
         tgt_layout.addSpacing(16)
 
+        # 定向客户端: 默认广播 deauth, 选中某个在线客户端后只踢它
+        cli_cap = QLabel("客户端")
+        cli_cap.setStyleSheet("color: #90a4ae;")
+        tgt_layout.addWidget(cli_cap)
+        self.client_combo = QComboBox()
+        self.client_combo.setMinimumWidth(150)
+        self.client_combo.addItem("全部 (广播)", "")
+        self.client_combo.setToolTip(
+            "deauth 目标: 默认广播(踢所有客户端); 选中某个在线客户端可定向")
+        tgt_layout.addWidget(self.client_combo)
+
         tgt_layout.addStretch()
 
         self.progress_bar = QProgressBar()
@@ -479,14 +490,14 @@ class MainUI(QWidget):
         # 扫描与停止合并为一个切换按钮
         self.btn_scan = QPushButton("🔍 扫描")
         self.btn_scan.setStyleSheet(
-            "font-weight: bold; background: #1976d2; color: white;")
+            "font-weight: bold;")
         self.btn_scan.setToolTip("点击开始扫描 AP；扫描中点击可随时停止（不关闭监听）")
         self.btn_capture = QPushButton("📡 抓握手包")
-        self.btn_capture.setStyleSheet("font-weight: bold; background: #f57c00; color: white;")
+        self.btn_capture.setStyleSheet("font-weight: bold;")
         self.btn_capture.setToolTip("自动对目标 AP 发送 deauth 促使客户端重连，并抓取握手包（双击AP表格也可开始/停止）")
-        for b in (self.btn_scan,):
+        for b in (self.btn_scan, self.btn_capture):
             b.setMinimumHeight(32)
-            ctrl_layout.addWidget(b)
+            ctrl_layout.addWidget(b, 1)
         ap_group_layout.addLayout(ctrl_layout)
 
         main_splitter.addWidget(ap_group)
@@ -510,7 +521,7 @@ class MainUI(QWidget):
         # 开始破解与停止合并为一个切换按钮
         self.btn_start_crack = QPushButton("▶ 开始破解")
         self.btn_start_crack.setStyleSheet(
-            "font-weight: bold; background: #2e7d32; color: white;")
+            "font-weight: bold;")
         self.btn_start_crack.setToolTip("点击开始破解；破解中点击可随时停止")
         self.btn_copy_wifi = QPushButton("📋 复制WiFi")
         self.btn_copy_wifi.setToolTip(
@@ -523,7 +534,11 @@ class MainUI(QWidget):
         self.btn_batch_add = QPushButton("📥 批量加入")
         self.btn_batch_add.setToolTip(
             "把握手包库中选中的多个握手包一次性加入右侧列表批量破解")
-        for b in (self.btn_start_crack, self.btn_batch_add, self.btn_copy_wifi,
+        self.btn_import_cap = QPushButton("📂 导入握手包")
+        self.btn_import_cap.setToolTip(
+            "从电脑导入一个或多个外部握手包(.cap/.pcap)加入右侧破解列表")
+        for b in (self.btn_start_crack, self.btn_batch_add,
+                  self.btn_import_cap, self.btn_copy_wifi,
                   self.btn_note, self.btn_del_record, self.btn_export):
             b.setMinimumHeight(32)
             result_btn_layout.addWidget(b)
@@ -799,13 +814,13 @@ class MainUI(QWidget):
             self.btn_scan.setEnabled(True)
             self.btn_scan.setText("🔍 扫描")
             self.btn_scan.setStyleSheet(
-                "font-weight: bold; background: #1976d2; color: white;")
+                "font-weight: bold;")
 
         elif status == "scanning":
             self.btn_scan.setEnabled(True)
             self.btn_scan.setText("⏹ 停止扫描")
             self.btn_scan.setStyleSheet(
-                "font-weight: bold; background: #c62828; color: white;")
+                "font-weight: bold;")
             self.btn_scan.setToolTip("扫描进行中，点击可随时停止（不关闭监听模式）")
         elif status == "stopping":
             self.btn_scan.setEnabled(False)
