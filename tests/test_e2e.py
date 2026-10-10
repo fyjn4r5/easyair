@@ -1174,7 +1174,7 @@ def main():
     w.lbl_target_essid.setText("T"); w.lbl_target_bssid.setText("AA:00:00:00:00:01")
     w.lbl_target_ch.setText("6")
     w.core.airodump_capture = lambda *a: (order_seq.append("airodump") or _FakeProc())
-    w.core.deauth = lambda *a: (order_seq.append("deauth") or _FakeProc())
+    w.core.deauth = lambda *a: (order_seq.append("deauth") or (True, "[deauth] ok"))
     w._on_capture_started = lambda p: None
     captured_fn = []
     w._run_worker = lambda fn, on_done=None: captured_fn.append(fn)
@@ -1185,6 +1185,61 @@ def main():
     check("先开 airodump 后 deauth", order_seq == ["airodump", "deauth"],
           str(order_seq))
     w.set_scan_status("idle")
+
+    section("deauth 真实结果解析 + WPA3/PMF 提示 + 嗅探日志文案")
+    _core = C.AirCore()
+    _core._run_sudo = lambda args: subprocess.CompletedProcess(
+        args, 0, "Sending 64 directed DeAuth (code 7). STMAC: [AA] [10|64 ACKs]", "")
+    ok, m = _core.deauth("wlan0mon", "AA:00:00:00:00:01", 10, "BB:00:00:00:00:01")
+    check("deauth 成功时返回 True 并含'已发送'", ok is True and "已发送" in m, m)
+    _core._run_sudo = lambda args: subprocess.CompletedProcess(
+        args, 1, "No such BSSID available.", "")
+    ok2, m2 = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
+    check("deauth 找不到目标时返回 False 并说明",
+          ok2 is False and "找不到" in m2, m2)
+    _core._run_sudo = lambda args: subprocess.CompletedProcess(
+        args, 1, "No such BSSID available.", "No such BSSID available.")
+    ok3, m3 = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
+    check("deauth 失败描述不是空的", ok2 is False and bool(m2) and bool(m3), m3)
+    _core._run_sudo = lambda args: subprocess.CompletedProcess(
+        args, 1, "", "no privilege")
+    _okp, _mp = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
+    check("无提权时提示检查 ~/.Pas", _okp is False and "~/.Pas" in _mp, _mp)
+
+
+    # WPA3/SAE/PMF 目标必须给出明确提示(否则用户会一直干等)
+    w._ap_sec = {"AA:00:00:00:00:01": ("WPA3", "CCMP", "SAE")}
+    w.log_scan_box.clear()
+    w._warn_target_security("AA:00:00:00:00:01")
+    _warn_txt = w.log_scan_box.toPlainText()
+    check("WPA3 目标提示 deauth 会被忽略", "WPA3" in _warn_txt, _warn_txt)
+    w._ap_sec = {"AA:00:00:00:00:01": ("WPA2", "CCMP", "PSK")}
+    w.log_scan_box.clear()
+    w._warn_target_security("AA:00:00:00:00:01")
+    check("WPA2 目标不误报", w.log_scan_box.toPlainText().strip() == "",
+          w.log_scan_box.toPlainText())
+
+    # 嗅探启动日志不能再引用已被删除的"数据帧"标签页
+    class _Sig:
+        def connect(self, *a):
+            pass
+
+    class _FakeTh:
+        def __init__(self):
+            self.finished = _Sig()
+
+    _real_spawn = w._spawn_cmd
+    _real_st = w._sniffer_thread
+    w._spawn_cmd = lambda proc, cb: _FakeTh()
+    w._sniffer_thread = None
+    w.log_scan_box.clear()
+    w._on_sniffer_started(object())
+    _sniff_txt = w.log_scan_box.toPlainText()
+    check("嗅探启动日志不再提'数据帧'标签页",
+          "数据帧'标签页" not in _sniff_txt and "状态行" in _sniff_txt,
+          _sniff_txt)
+    w._spawn_cmd = _real_spawn
+    w._sniffer_thread = _real_st
 
     # ---- 倒计时连续性(用户报告"倒计时不连续/中途闪退") ----
     section("倒计时连续性与表格重绘")

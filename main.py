@@ -1771,6 +1771,7 @@ class EasyAirApp(MainUI):
         hidden_count = 0
         self._client_tips = {}
         self._ap_clients = {}
+        self._ap_sec = {}
         # airodump 的分隔符是 ", "，引号前多一个空格会使 CSV 规范失效，
         # 含逗号的 SSID(如 "Cafe, Guest") 会被切成两列。先归一化再解析。
         txt = re.sub(r",\s+(?=\")", ",", txt)
@@ -1847,6 +1848,7 @@ class EasyAirApp(MainUI):
                     clients.append({"mac": m, "power": "", "packets": ""})
             client_count = len(clients)
             self._ap_clients[bssid.upper()] = [c["mac"] for c in clients]
+            self._ap_sec[bssid.upper()] = (priv, cipher, auth)
             client_str = f"{client_count} 客户端"
             if client_count:
                 # 列窄, 只显示数量; MAC 明细放 tooltip
@@ -1938,6 +1940,18 @@ class EasyAirApp(MainUI):
                 return str(data)
         return ""
 
+    def _warn_target_security(self, bssid: str):
+        """目标若为 WPA3/SAE 或启用 PMF(802.11w), deauth 会被忽略 ——
+        这是"一直抓不到握手"最常见的原因, 必须给用户明确提示。"""
+        sec = getattr(self, "_ap_sec", {}).get(bssid.upper()) or ()
+        priv, cipher, auth = (list(sec) + ["", "", ""])[:3]
+        joined = f"{priv}/{cipher}/{auth}".upper()
+        if "WPA3" in joined or "SAE" in joined or "GCMP" in joined \
+                or "OWE" in joined:
+            self.log("[提示] 该 AP 为 WPA3/SAE 或启用管理帧保护(802.11w)："
+                     "deauth 解关联会被 AP 忽略，通常抓不到四次握手，"
+                     "建议换未启用 PMF 的 WPA2 目标")
+
     # ===== 抓包 =====
     def _toggle_scan(self):
         """扫描/停止合并为一个按钮。"""
@@ -1970,6 +1984,8 @@ class EasyAirApp(MainUI):
         if essid == "未选择" or not bssid:
             QMessageBox.warning(self, "提示", "请先在左侧列表点击选择目标 AP")
             return
+
+        self._warn_target_security(bssid)
 
         if not self.mon_iface:
             # 监听没开就自动开, 不再要求用户先去顶部点一次
@@ -2021,14 +2037,12 @@ class EasyAirApp(MainUI):
             # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL。
             # 等 airodump 起稳后再发第一次 deauth, 之后由定时器自动重试。
             time.sleep(2.0)
-            dp = self.core.deauth(self.mon_iface, bssid, 10, client)
-            if dp:
-                self.log(f"[deauth] 已发送 10 次解关联 → {bssid}"
-                         + (f" (定向 {client})" if client else " (广播)"))
-            else:
-                self.log("[deauth] 发送失败, 可能抓不到握手包")
+            ok, msg = self.core.deauth(self.mon_iface, bssid, 10, client)
+            self.log(msg)
+            if not ok:
+                self.log("[deauth] 注入失败: 抓不到握手多半是 deauth 没生效, "
+                         "而非客户端不在线")
             return proc
-
         self._capture_running = True
         self._cap_start = time.time()
         self._handshake_found = False
@@ -2078,10 +2092,21 @@ class EasyAirApp(MainUI):
             return
         client = self._selected_client()
         self._deauth_attempts += 1
-        self.log(f"[deauth] 尚未捕获握手, 第 {self._deauth_attempts} 次重发 → {bssid}"
-                 + (f" (定向 {client})" if client else " (广播)"))
+        self.log(f"[deauth] 尚未捕获握手, 第 {self._deauth_attempts} 次重发 → "
+                 f"{bssid}" + (f" (定向 {client})" if client else " (广播)"))
         self._run_worker(
-            lambda: self.core.deauth(self.mon_iface, bssid, 10, client), None)
+            lambda: self.core.deauth(self.mon_iface, bssid, 10, client),
+            self._on_deauth_result)
+
+    def _on_deauth_result(self, res):
+        """记录 deauth 真实结果; 注入失败时明确告诉用户, 不要让人干等。"""
+        try:
+            ok, msg = res
+        except (TypeError, ValueError):
+            return
+        self.log(msg)
+        if not ok:
+            self.set_status(msg)
 
     def _check_handshake(self):
         """轮询本次抓包文件, 用 has_handshake 真校验 EAPOL, 而非看文件存在。"""
@@ -2296,7 +2321,7 @@ class EasyAirApp(MainUI):
         t = self._spawn_cmd(proc, self._on_sniffer_line)
         t.finished.connect(lambda: self._forget_sniffer(t))
         self._sniffer_thread = t
-        self.log("[客户端] 已启动数据帧嗅探 · 实时帧见下方'📶 数据帧'标签页")
+        self.log("[客户端] 已启动数据帧嗅探 · DATA/PROBE 计数见顶部状态行")
 
     def _forget_sniffer(self, t):
         if getattr(self, "_sniffer_thread", None) is t:
@@ -2861,7 +2886,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.20.1"
+VERSION = "1.21.0"
 
 
 def _selftest() -> int:

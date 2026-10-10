@@ -694,13 +694,40 @@ class AirCore:
         return self.run_cmd(cmd, sudo=True)
 
     def deauth(self, mon_iface: str, bssid: str, count: int = 10, client: str = ""):
-        """发送 deauth 迫使客户端重连。
+        """发送 deauth 迫使客户端重连, 返回 (是否成功注入, 描述)。
 
         指定 client 时只定向踢该客户端, 否则广播。没有客户端在线时广播
-        deauth 也抓不到握手, 定向可减少对无关设备的干扰。"""
+        deauth 也抓不到握手, 定向可减少对无关设备的干扰。
+
+        关键: 以前是 fire-and-forget —— 只要进程起来了就报"已发送", 但
+        驱动不支持注入/信道不符/No such BSSID 时其实一帧都没发出去, 用户
+        只看到"一直抓不到"却没有任何线索。这里同步读取 aireplay-ng 输出
+        并判定真实结果。"""
         cli = f" -c {client}" if client else ""
         cmd = f"aireplay-ng --deauth {count} -a {bssid}{cli} {mon_iface}"
-        return self.run_cmd(cmd, sudo=True)
+        try:
+            r = self._run_sudo(shlex.split(cmd))
+        except PermissionError as e:
+            return False, f"deauth 需要提权: {e}"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return False, f"deauth 执行失败: {e}"
+        out = f"{r.stdout or ''}\n{r.stderr or ''}"
+        low = out.lower()
+        if "no such bssid" in low:
+            return False, (f"deauth 注入失败: 找不到 {bssid} "
+                           f"(信道不符或目标已消失)")
+        if "no privilege" in low or "密码验证失败" in out:
+            return False, "deauth 需要提权: 请检查 ~/.Pas 中的 sudo 密码"
+        if "not support" in low or "does not support" in low:
+            return False, "deauth 失败: 网卡/驱动不支持帧注入(无法踢客户端)"
+        if re.search(r"\bsending\b", low):
+            return True, (f"[deauth] 已发送 {count} 次解关联 → {bssid}"
+                          + (f" (定向 {client})" if client else " (广播)"))
+        if re.search(r"send failed|write failed|no injection|not support", low):
+            return False, ("deauth 注入失败: 网卡不支持注入或信道不符, "
+                           "可尝试换网卡/换信道")
+        tail = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:80]
+        return False, f"deauth 未确认发送: {tail or '无输出'}"
 
     def has_handshake(self, cap_file) -> bool:
         """校验 .cap/.pcap 里是否真的含 WPA/WPA2 四次握手(或 PMKID)。
