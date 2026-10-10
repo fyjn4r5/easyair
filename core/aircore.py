@@ -14,6 +14,27 @@ from typing import List, Optional, Tuple
 APP_NAME = "easyair"
 
 
+def _user_home() -> Path:
+    """返回"真人"的主目录。
+
+    以 root 运行时(sudo/pkexec 启动 GUI 以免反复输密码), Path.home() 会
+    变成 /root, 于是配置写到 /root/.easyair —— 下次以普通用户启动读的是
+    ~/.easyair, 设置凭空消失。这里优先用 SUDO_USER/PKEXEC_UID 还原真实
+    用户的主目录, 保证提权启动和普通启动读到同一份配置。"""
+    if os.geteuid() == 0:
+        import pwd
+        user = os.environ.get("SUDO_USER")
+        uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+        try:
+            if user and user != "root":
+                return Path(pwd.getpwnam(user).pw_dir)
+            if uid:
+                return Path(pwd.getpwuid(int(uid)).pw_dir)
+        except (KeyError, ValueError, OSError):
+            pass
+    return Path.home()
+
+
 def _data_dir() -> Path:
     """数据目录。
 
@@ -21,7 +42,7 @@ def _data_dir() -> Path:
     (/tmp/_MEIxxxxxx/), 重启即被删除 —— 配置/历史/抓包都会丢失。
     因此打包后一律放到用户主目录下的固定路径。"""
     if getattr(sys, "frozen", False):
-        return Path.home() / f".{APP_NAME}"
+        return _user_home() / f".{APP_NAME}"
     return Path(__file__).parent.parent
 
 
@@ -96,7 +117,7 @@ class AirCore:
         }
         if CONFIG_FILE.exists():
             try:
-                with open(CONFIG_FILE) as f:
+                with open(CONFIG_FILE, encoding="utf-8") as f:
                     saved = json.load(f)
                 self.config.update(saved)
                 # 迁移: 早期默认是不自动停止(0), 配置文件里存了 0 会一直
@@ -108,13 +129,22 @@ class AirCore:
             except (json.JSONDecodeError, OSError, ValueError):
                 pass
 
-    def save_config(self):
+    def save_config(self) -> bool:
+        """原子写回配置。
+
+        先写临时文件再 os.replace: 避免写一半崩溃/断电留下半截 JSON, 下次
+        启动解析失败回落默认值(表现为"设置又丢了")。返回是否成功, 供上层
+        在失败时给出可见提示(而不是只在 stdout 打一行没人看的日志)。"""
         try:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with open(CONFIG_FILE, 'w') as f:
+            tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except OSError as e:
-            print(f"[配置保存失败] {e}")
+            os.replace(tmp, CONFIG_FILE)
+            return True
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[配置保存失败] {CONFIG_FILE}: {e}")
+            return False
 
     def add_wordlist(self, path: str):
         p = str(Path(path).resolve())

@@ -82,12 +82,11 @@ def main():
           str(w.lbl_engine.parent()))
 
     section("布局: 底部标签页")
-    check("底部有 4 个 tab", w.bottom_tabs.count() == 4, str(w.bottom_tabs.count()))
-    check("底部 4 个标签页", w.bottom_tabs.count() == 4, str(w.bottom_tabs.count()))
+    check("底部有 3 个 tab", w.bottom_tabs.count() == 3, str(w.bottom_tabs.count()))
+    check("底部 3 个标签页", w.bottom_tabs.count() == 3, str(w.bottom_tabs.count()))
     check("tab0=握手包库", "握手包库" in w.bottom_tabs.tabText(0), w.bottom_tabs.tabText(0))
     check("tab1=抓包日志", "抓包" in w.bottom_tabs.tabText(1), w.bottom_tabs.tabText(1))
-    check("tab2=数据帧", "数据帧" in w.bottom_tabs.tabText(2), w.bottom_tabs.tabText(2))
-    check("tab3=破解日志", "破解" in w.bottom_tabs.tabText(3), w.bottom_tabs.tabText(3))
+    check("tab2=破解日志", "破解" in w.bottom_tabs.tabText(2), w.bottom_tabs.tabText(2))
     check("握手包库已移入底部tab", w.cap_tree.parent() is not w.ap_table.parent())
     check("两个日志框独立", w.log_scan_box is not w.log_crack_box)
     check("日志框有行数上限", w.log_scan_box.maximumBlockCount() > 0)
@@ -1007,6 +1006,36 @@ def main():
     _dlg.deleteLater()
     _c.config["wordlists"] = _saved_wl
 
+    section("设置: 扫描时间/字典持久化(含 0=手动停止) + 保存失败可见")
+    _pdir = tmp / "persist"
+    _pdir.mkdir(exist_ok=True)
+    _old_cfg, _old_hist = C.CONFIG_FILE, C.HISTORY_FILE
+    C.CONFIG_FILE = _pdir / "settings.json"
+    C.HISTORY_FILE = _pdir / "history.json"
+    # 手动停止(0)必须原样保存/读回, 不能被 "or 45" 顶掉
+    w.core.config["scan_auto_stop"] = 0
+    w.core.config["scan_auto_stop_explicit"] = True
+    w.core.config["wordlists"] = ["/tmp/easyair-persist.dict"]
+    check("save_config 返回成功", w.core.save_config() is True)
+    check("写盘后无残留 .tmp",
+          not (_pdir / "settings.json.tmp").exists(), str(_pdir))
+    _re = C.AirCore()
+    check("扫描时间 0 持久化后仍为 0",
+          _re.config.get("scan_auto_stop") == 0,
+          str(_re.config.get("scan_auto_stop")))
+    check("字典路径持久化后仍在",
+          _re.config.get("wordlists") == ["/tmp/easyair-persist.dict"],
+          str(_re.config.get("wordlists")))
+    _reload_dlg = U.CrackSettingsDialog(w, _re.config)
+    check("对话框显示 手动停止(0) 而非回落到 45",
+          _reload_dlg.scan_secs.value() == 0,
+          str(_reload_dlg.scan_secs.value()))
+    # 保存路径不可写时必须返回 False(而不是静默丢设置)
+    C.CONFIG_FILE = C.Path("/proc/easyair-nope/settings.json")
+    check("不可写路径 save_config 返回 False",
+          w.core.save_config() is False)
+    C.CONFIG_FILE, C.HISTORY_FILE = _old_cfg, _old_hist
+
     section("本轮: 右侧结果右键菜单/可关闭标签 + 实时状态行 + 左侧客户端数刷新")
     check("结果标签可关闭", w.result_tabs.tabsClosable())
     _n_tabs = w.result_tabs.count()
@@ -1014,15 +1043,19 @@ def main():
         w._on_result_tab_close(0)
         check("关闭一个标签生效", w.result_tabs.count() == _n_tabs - 1,
               f"{_n_tabs}->{w.result_tabs.count()}")
-    # 只剩一个时不允许关闭
-    while w.result_tabs.count() > 1:
+    # 允许关闭到 0 个标签; 之后 _ensure_result_tab 会自动补回今天
+    while w.result_tabs.count() > 0:
         w._on_result_tab_close(0)
-    w._on_result_tab_close(0)
-    check("至少保留一个结果标签", w.result_tabs.count() == 1)
+    check("可以关闭全部结果标签", w.result_tabs.count() == 0,
+          str(w.result_tabs.count()))
+    _t = w._ensure_result_tab()
+    check("关闭全部后自动补回结果标签", w.result_tabs.count() == 1 and _t is not None,
+          str(w.result_tabs.count()))
 
     # 结果树右键菜单相关方法存在
-    for _m in ("_result_menu", "_reveal_cap_in_library",
-               "_clear_results_of_date", "_update_ap_row_clients"):
+    for _m in ("_result_menu", "_result_tab_menu", "_ensure_result_tab",
+               "_reveal_cap_in_library", "_clear_results_of_date",
+               "_update_ap_row_clients"):
         check(f"存在 {_m}", hasattr(w, _m))
 
     # 实时状态行: 空闲时应显示"空闲"且是一个非滚动标签
@@ -1937,30 +1970,33 @@ def main():
            "SA:aa:bb:cc:dd:ee:01 Probe Request ()")
     check("探测请求不产生客户端", _P(_l5) is None, str(_P(_l5)))
 
-    section("实时数据帧窗口(像 minidwep 显示 data/广播帧)")
-    _F = w._format_pkt_line
-    _d = _F(_l1)  # DATA, DA 广播
-    check("数据帧显示为 DATA", _d and "DATA" in _d
-          and "98:3F:A4:67:36:D0" in _d and "6C:11:BA:9F:63:EF" in _d, str(_d))
-    check("广播数据帧标注[广播]", _d and "[广播]" in _d, str(_d))
-    _d2 = _F(_l3)  # QoS Data, DA 单播
-    check("单播数据帧不标广播", _d2 and "DATA" in _d2
-          and "[广播]" not in _d2, str(_d2))
+    section("数据帧类型统计(DATA/PROBE 数量显示在顶部状态行)")
+    _C = w._classify_pkt
+    check("数据帧归类 DATA", _C(_l1) == "DATA", str(_C(_l1)))
+    check("QoS 数据帧归类 DATA", _C(_l3) == "DATA", str(_C(_l3)))
+    check("探测请求归类 PROBE", _C(_l5) == "PROBE", str(_C(_l5)))
     _de = ("10:00:01.0 x DA:ff:ff:ff:ff:ff:ff BSSID:11:22:33:44:55:66 "
            "SA:11:22:33:44:55:66 DeAuthentication ()")
-    _df = _F(_de)
-    check("去认证帧显示 DEAUTH+广播", _df and "DEAUTH" in _df
-          and "[广播]" in _df, str(_df))
-    _pf = _F(_l5)
-    check("探测请求显示 PROBE", _pf and "PROBE" in _pf, str(_pf))
-    check("Beacon 不进数据帧窗口", _F(_l4) is None, str(_F(_l4)))
-    w._clear_pkt()
-    w._append_pkt(_l1)
-    check("数据帧窗口收到内容",
-          "DATA" in w.pkt_box.toPlainText(), w.pkt_box.toPlainText()[:60])
-    # _on_sniffer_line 累积
+    check("去认证归类 DEAUTH", _C(_de) == "DEAUTH", str(_C(_de)))
+    check("Beacon 不归类", _C(_l4) is None, str(_C(_l4)))
+    check("无 SA 行不归类", _C("garbage line") is None, "x")
+    w._reset_pkt_counts()
+    check("初始无帧计数后缀", w._frame_counts_str() == "", w._frame_counts_str())
     w._sniffed_clients = {}
     w._sniff_noticed = True  # 不刷日志
+    w._on_sniffer_line(_l1)
+    w._on_sniffer_line(_l1)  # DATA +2
+    w._on_sniffer_line(_l5)  # PROBE +1
+    check("DATA 计数累加", w._pkt_counts.get("DATA") == 2,
+          str(w._pkt_counts))
+    check("PROBE 计数累加", w._pkt_counts.get("PROBE") == 1,
+          str(w._pkt_counts))
+    check("状态行后缀含 DATA/PROBE 数量",
+          "DATA 2" in w._frame_counts_str() and "PROBE 1" in w._frame_counts_str(),
+          w._frame_counts_str())
+    check("已无数据帧标签页", not hasattr(w, "pkt_box"), "")
+    # _on_sniffer_line 累积在线客户端
+    w._sniffed_clients = {}
     w._on_sniffer_line(_l1)
     w._on_sniffer_line(_l2)
     w._on_sniffer_line(_l1)  # 重复不重复计

@@ -157,6 +157,7 @@ class EasyAirApp(MainUI):
         super().__init__()
         # 打包后必须用稳定目录, 否则配置/历史会随临时目录一起消失
         self.core = AirCore()
+        self.log(f"[配置] {self.core.config_dir / 'settings.json'}")
         self.scan_thread = None
         self.cap_thread = None
         # 独立客户端嗅探(tcpdump data 帧): airodump 的 Station 段在本机
@@ -166,6 +167,7 @@ class EasyAirApp(MainUI):
         self._sniffer_users = set()
         self._sniffed_clients = {}
         self._sniff_noticed = False
+        self._pkt_counts = {}
         self.crack_thread = None
         self.conv_thread = None
         self.mon_thread = None
@@ -259,6 +261,11 @@ class EasyAirApp(MainUI):
             self._persist_record()
         except Exception as e:  # noqa: BLE001
             print(f"[退出] 保存进度失败: {e}")
+        try:
+            # 设置/字典改动后已即时落盘, 这里退出再兜底保存一次
+            self.core.save_config()
+        except Exception as e:  # noqa: BLE001
+            print(f"[退出] 保存配置失败: {e}")
 
         mon = self.mon_iface
         self.mon_iface = None
@@ -307,6 +314,9 @@ class EasyAirApp(MainUI):
         self.btn_note.clicked.connect(self._edit_note)
         self.btn_del_record.clicked.connect(self._delete_record)
         self.result_tabs.tabCloseRequested.connect(self._on_result_tab_close)
+        self.result_tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.result_tabs.tabBar().customContextMenuRequested.connect(
+            self._result_tab_menu)
         self.log_tabs.currentChanged.connect(lambda _i: None)
 
         # AP 表格单击/双击选择目标并可开始抓包
@@ -475,12 +485,13 @@ class EasyAirApp(MainUI):
             elapsed = self._format_elapsed(
                 getattr(self, "_cap_start", time.time()))
             txt = (f"📡 抓包中 · {bssid} · CH{ch} · 在线客户端 {n} · "
-                   f"deauth {self._deauth_attempts} 次 · 耗时 {elapsed}")
+                   f"deauth {self._deauth_attempts} 次 · 耗时 {elapsed}"
+                   f"{self._frame_counts_str()}")
             self._apply_live(txt, ("#ffe082", "#e65100", "#fff8e1"))
             return
         if self.scan_timer.isActive():
             txt = (f"🔍 扫描中 · 已发现 {self.ap_table.rowCount()} 个 AP · "
-                   f"剩余 {self._countdown_num()}s")
+                   f"剩余 {self._countdown_num()}s{self._frame_counts_str()}")
             self._apply_live(txt, ("#a5d6a7", "#1b5e20", "#e8f5e9"))
             return
         self._apply_live("● 空闲", ("#cfd8dc", "#37474f", "#eceff1"))
@@ -683,8 +694,16 @@ class EasyAirApp(MainUI):
         if dlg.exec_() == WordListDialog.Accepted:
             new_lists = dlg.get_wordlists()
             self.core.config["wordlists"] = new_lists
-            self.core.save_config()
-            self.log(f"[字典] 已更新，共 {len(new_lists)} 个字典文件")
+            ok = self.core.save_config()
+            if ok:
+                self.log(f"[字典] 已保存 {len(new_lists)} 个字典文件")
+                self.set_status(f"字典已保存 ({len(new_lists)} 个)")
+            else:
+                self.log("[字典] 保存失败！配置目录不可写")
+                QMessageBox.warning(
+                    self, "保存失败",
+                    "字典配置写入失败，请检查配置目录是否可写：\n"
+                    f"{self.core.config_dir / 'settings.json'}")
 
     def _open_crack_settings(self):
         dlg = CrackSettingsDialog(self, self.core.config)
@@ -692,15 +711,18 @@ class EasyAirApp(MainUI):
             return
         vals = dlg.values()
         self.core.config.update(vals)
-        self.core.save_config()
+        ok = self.core.save_config()
         self.auto_monitor_enabled = vals["auto_monitor"]
         self.scan_auto_stop = vals["scan_auto_stop"]
         self._refresh_engine_label()
-        self.log(f"[设置] 引擎={vals['crack_engine']} | 设备={vals['crack_device']}")
-        self.log(f"[设置] GPU 温度上限={vals['hashcat_temp_limit'] or '不限制'}")
-        self.log(f"[设置] 扫描自动停止="
-                 f"{self.scan_auto_stop}s" if self.scan_auto_stop else "[设置] 扫描需手动停止")
-        self.set_status("设置已保存")
+        if not ok:
+            QMessageBox.warning(
+                self, "保存失败",
+                "设置写入失败，请检查配置目录是否可写：\n"
+                f"{self.core.config_dir / 'settings.json'}")
+            return
+        self.log(f"[设置] 已保存 · 扫描时长 "
+                 f"{self.scan_auto_stop or '手动停止'} · 引擎={vals['crack_engine']}")
 
     def _refresh_engine_label(self):
         engine = self.core.config.get("crack_engine", "Hashcat (GPU/CPU)")
@@ -739,17 +761,49 @@ class EasyAirApp(MainUI):
         self.result_tabs.blockSignals(False)
         self.current_crack_date = self._tab_date(0) or today_str()
 
+    def _ensure_result_tab(self):
+        """确保右侧至少有一个可用的结果标签页, 返回其 tree。"""
+        if self.result_tabs.count() == 0:
+            date = today_str()
+            tree = self._make_result_tree(date)
+            self.result_tabs.addTab(tree, f"{date} ({tree.topLevelItemCount()})")
+            self.current_crack_date = date
+        return self._current_result_tree()
+
     def _on_result_tab_close(self, index: int):
         """关闭一个日期标签页。
 
-        关闭只影响显示, 历史记录仍在 history.json 里; 若全部关闭则补回
-        今天的空标签页, 保证右侧始终有一个可用的破解列表。"""
-        if index < 0 or self.result_tabs.count() <= 1:
-            # 保留最后一个: 否则右侧没有目标列表, 开始破解无处可写
-            if self.result_tabs.count() == 1:
-                self.set_status("至少保留一个破解结果标签页")
+        关闭只影响显示, 历史记录仍在 history.json 里。允许全部关闭;
+        下次加入/开始破解时会自动补回今天的空标签页 (_ensure_result_tab)。"""
+        if index < 0 or index >= self.result_tabs.count():
             return
+        page = self.result_tabs.widget(index)
         self.result_tabs.removeTab(index)
+        if page is not None:
+            page.deleteLater()
+
+    def _result_tab_menu(self, pos):
+        """结果标签栏右键菜单: 关闭当前 / 关闭其他 / 关闭全部。"""
+        idx = self.result_tabs.tabBar().tabAt(pos)
+        menu = QMenu(self)
+        act_cur = menu.addAction("关闭当前标签")
+        act_other = menu.addAction("关闭其他标签")
+        act_all = menu.addAction("关闭全部标签")
+        act_cur.setEnabled(idx >= 0)
+        act_other.setEnabled(idx >= 0 and self.result_tabs.count() > 1)
+        act_all.setEnabled(self.result_tabs.count() > 0)
+        chosen = menu.exec_(self.result_tabs.tabBar().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_cur:
+            self._on_result_tab_close(idx)
+        elif chosen == act_other:
+            for i in reversed([j for j in range(self.result_tabs.count())
+                               if j != idx]):
+                self._on_result_tab_close(i)
+        elif chosen == act_all:
+            while self.result_tabs.count():
+                self._on_result_tab_close(0)
 
     def _tab_date(self, index=None) -> str:
         idx = self.result_tabs.currentIndex() if index is None else index
@@ -919,10 +973,7 @@ class EasyAirApp(MainUI):
                 self, "提示",
                 "请先在下方「握手包库」中按住 Ctrl 或 Shift 多选要破解的握手包")
             return
-        tree = self._current_result_tree()
-        if tree is None:
-            QMessageBox.information(self, "提示", "请先打开一个破解结果标签页")
-            return
+        tree = self._ensure_result_tab()
         added = 0
         # 已在列表里的(同路径)不重复加入
         existing = set()
@@ -960,7 +1011,7 @@ class EasyAirApp(MainUI):
         if not files:
             return
         dest_dir = self.core._dated_dir()
-        tree = self._current_result_tree()
+        tree = self._ensure_result_tab()
         existing = set()
         if tree is not None:
             for i in range(tree.topLevelItemCount()):
@@ -2115,7 +2166,7 @@ class EasyAirApp(MainUI):
 
     def _add_cap_to_crack(self, cap, essid=None, bssid=None) -> bool:
         """把一个握手包加入右侧破解列表(已存在则跳过)。"""
-        tree = self._current_result_tree()
+        tree = self._ensure_result_tab()
         if tree is None:
             return False
         cap = Path(cap)
@@ -2266,8 +2317,14 @@ class EasyAirApp(MainUI):
                 pass
 
     def _on_sniffer_line(self, line: str):
-        # 实时数据帧窗口: 把抓到的帧显示到"数据帧"标签页(像 minidwep 的信息窗口)
-        self._append_pkt(line)
+        # 数据帧窗口已取消: 只按帧类型累加计数, 数量显示在顶部实时状态行
+        try:
+            kind = self._classify_pkt(line)
+        except Exception:
+            kind = None
+        if kind:
+            self._pkt_counts[kind] = self._pkt_counts.get(kind, 0) + 1
+        # 从数据帧里找出在线客户端(补 airodump 不列关联客户端)
         try:
             hit = self.core.parse_sniffer_line(line)
         except Exception:
@@ -2281,9 +2338,39 @@ class EasyAirApp(MainUI):
         bag.add(mac)
         if not getattr(self, "_sniff_noticed", False):
             self._sniff_noticed = True
-            self.log(f"[客户端] 嗅探到在线客户端 {mac} (AP {bssid})")
+            self.log(f"[客户端] 已嗅探到在线客户端 {mac} (AP {bssid})")
 
     _BCAST = ("FF:FF:FF:FF:FF:FF", "01:00:5E", "33:33", "01:80:C2")
+
+    def _classify_pkt(self, line: str) -> Optional[str]:
+        """按帧类型分类: DATA / PROBE / DEAUTH / DISSOC / EAPOL, 否则 None。"""
+        if not line or "SA:" not in line:
+            return None
+        low = line.lower()
+        if "probe request" in low:
+            return "PROBE"
+        if "deauth" in low:
+            return "DEAUTH"
+        if "disassoc" in low:
+            return "DISSOC"
+        if "eapol" in low:
+            return "EAPOL"
+        if "beacon" in low:
+            return None
+        if "data" in low or "qos" in low:
+            return "DATA"
+        return None
+
+    def _reset_pkt_counts(self):
+        self._pkt_counts = {}
+
+    def _frame_counts_str(self) -> str:
+        """顶部状态行里的 DATA/PROBE 数量后缀。"""
+        data = self._pkt_counts.get("DATA", 0)
+        probe = self._pkt_counts.get("PROBE", 0)
+        if not data and not probe:
+            return ""
+        return f" · DATA {data} · PROBE {probe}"
 
     def _format_pkt_line(self, line: str):
         """把一行 tcpdump -e 输出压成简短可读的帧信息, 无效/噪音返回 None。"""
@@ -2319,21 +2406,8 @@ class EasyAirApp(MainUI):
         stamp = datetime.datetime.now().strftime("%H:%M:%S")
         return f"[{stamp}] {kind:<7} {body}{tail}"
 
-    def _append_pkt(self, line: str):
-        box = getattr(self, "pkt_box", None)
-        if box is None:
-            return
-        try:
-            txt = self._format_pkt_line(line)
-        except Exception:
-            return
-        if txt:
-            box.appendPlainText(txt)
-
     def _clear_pkt(self):
-        box = getattr(self, "pkt_box", None)
-        if box is not None:
-            box.clear()
+        self._pkt_counts = {}
 
     def _auto_on_target_done(self, cap):
         """全自动模式: 记录本次成功, 然后抓下一个。"""
@@ -2530,7 +2604,7 @@ class EasyAirApp(MainUI):
         if not bssid or bssid == "未选择":
             bssid = meta.get("bssid") or "-"
 
-        tree = self._current_result_tree()
+        tree = self._ensure_result_tab()
         self.current_crack_date = self._tab_date()
         self.current_crack_item = tree.add_target(bssid, essid, str(cap))
         self.current_crack_tree = tree
@@ -2787,7 +2861,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.19.0"
+VERSION = "1.20.0"
 
 
 def _selftest() -> int:

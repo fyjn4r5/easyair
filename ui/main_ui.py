@@ -259,7 +259,14 @@ class CrackSettingsDialog(QDialog):
         self.scan_secs.setSingleStep(15)
         self.scan_secs.setSuffix(" 秒")
         self.scan_secs.setSpecialValueText("手动停止")
-        self.scan_secs.setValue(int(config.get("scan_auto_stop", 45) or 45))
+        # 不能用 `value or 45`: 用户特意存的 0(手动停止) 会被当成假值
+        # 覆盖回 45, 显示上永远"保存不住"。
+        _saved_scan = config.get("scan_auto_stop", 45)
+        try:
+            _saved_scan = max(0, int(_saved_scan))
+        except (TypeError, ValueError):
+            _saved_scan = 45
+        self.scan_secs.setValue(_saved_scan)
         form.addRow("扫描自动停止:", self.scan_secs)
 
         self.temp_limit = QSpinBox()
@@ -658,10 +665,7 @@ class MainUI(QWidget):
 
         self.log_scan_box = self._make_log_box()
         self.log_crack_box = self._make_log_box()
-        # 实时数据帧窗口(类似 minidwep 的信息窗口): 显示抓到的 data/广播帧
-        self.pkt_box = self._make_log_box(4000)
         self.bottom_tabs.addTab(self.log_scan_box, "📡 抓包日志")
-        self.bottom_tabs.addTab(self.pkt_box, "📶 数据帧")
         self.bottom_tabs.addTab(self.log_crack_box, "🔓 破解日志")
         # 兼容旧引用
         self.log_tabs = self.bottom_tabs
