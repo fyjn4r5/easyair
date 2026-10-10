@@ -205,6 +205,8 @@ class EasyAirApp(MainUI):
         self._handshake_found = False
         self._hs_last = None
         self._deauth_attempts = 0
+        self._deauth_fails = 0
+        self._injection_unsupported = False
         self._auto_mode = False
         self._auto_queue = []
         self._auto_total = 0
@@ -2002,6 +2004,9 @@ class EasyAirApp(MainUI):
         self._sniff_noticed = False
         self._client_logged = False
         self._clear_pkt()
+        # 本轮抓包重置 deauth 失败计数/注入不可用标记
+        self._deauth_fails = 0
+        self._injection_unsupported = False
 
         # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
         # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL,
@@ -2087,6 +2092,8 @@ class EasyAirApp(MainUI):
         if not getattr(self, "_capture_running", False) or \
                 getattr(self, "_handshake_found", False):
             return
+        if getattr(self, "_injection_unsupported", False):
+            return
         bssid = self.lbl_target_bssid.text()
         if not self.mon_iface or not bssid:
             return
@@ -2105,8 +2112,36 @@ class EasyAirApp(MainUI):
         except (TypeError, ValueError):
             return
         self.log(msg)
-        if not ok:
-            self.set_status(msg)
+        if ok:
+            self._deauth_fails = 0
+            return
+        self.set_status(msg)
+        self._deauth_fails = getattr(self, "_deauth_fails", 0) + 1
+        # 连续失败 2 次且像是注入能力问题 → 判定网卡不支持注入, 停止空转重发
+        if (not getattr(self, "_injection_unsupported", False)
+                and self._deauth_fails >= 2
+                and ("注入" in msg or "超时" in msg or "不支持" in msg)):
+            self._injection_unsupported = True
+            if getattr(self, "deauth_retry_timer", None):
+                self.deauth_retry_timer.stop()
+            self.log("[网卡] 判定当前无线网卡无法注入 deauth 帧, 已停止自动重发。"
+                     "被动监听仍在继续, 若客户端自然重连仍可能抓到握手; "
+                     "否则请换支持监听+注入的外置 USB 网卡(如 AR9271/RT3070)。")
+            self._warn_injection_unsupported()
+
+    def _warn_injection_unsupported(self):
+        import os
+        if os.environ.get("QT_QPA_PLATFORM", "").lower().startswith("offscreen"):
+            return
+        from PyQt5.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self, "网卡不支持帧注入",
+            "当前无线网卡无法发送 deauth 解除关联帧, 因此踢不动客户端, "
+            "抓不到握手包。\n\n"
+            "这是网卡/驱动限制, 换软件无法解决。\n"
+            "请更换支持监听+注入的外置 USB 无线网卡"
+            "(如 Atheros AR9271、Ralink RT3070/5370 等)。\n\n"
+            "被动监听仍在继续, 若客户端自然重连可能仍会抓到握手。")
 
     def _check_handshake(self):
         """轮询本次抓包文件, 用 has_handshake 真校验 EAPOL, 而非看文件存在。"""
@@ -2886,7 +2921,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.21.0"
+VERSION = "1.22.0"
 
 
 def _selftest() -> int:

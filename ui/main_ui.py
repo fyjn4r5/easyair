@@ -534,6 +534,7 @@ class MainUI(QWidget):
         result_layout.setContentsMargins(8, 6, 8, 8)
         result_layout.setSpacing(6)
         self.result_tabs = QTabWidget()
+        self.result_tabs.setObjectName("resultTabs")
         self.result_tabs.setDocumentMode(True)
         # 标签可按需关闭(关闭只隐藏该日期视图, 历史记录仍在磁盘上)
         self.result_tabs.setTabsClosable(True)
@@ -743,6 +744,12 @@ class MainUI(QWidget):
             background: #ffffff;
             color: #1565c0;
             font-weight: bold;
+        }
+        /* 破解结果按日期分标签: 日期绝不能被省略/截断, 给足宽度。
+           全局 QTabBar::tab 只管内边距, 这里单独放宽结果标签。 */
+        QTabWidget#resultTabs QTabBar::tab {
+            padding: 6px 20px;
+            min-width: 104px;
         }
         """
 

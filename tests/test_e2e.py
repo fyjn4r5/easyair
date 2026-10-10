@@ -1048,6 +1048,16 @@ def main():
 
     section("本轮: 右侧结果右键菜单/可关闭标签 + 实时状态行 + 左侧客户端数刷新")
     check("结果标签可关闭", w.result_tabs.tabsClosable())
+    # 日期标签必须完整显示, 不能被截断
+    _bar = w.result_tabs.tabBar()
+    _fm = _bar.fontMetrics()
+    for _i in range(w.result_tabs.count()):
+        _t = w.result_tabs.tabText(_i)
+        check(f"结果标签'{_t}'宽度足够不截断",
+              _bar.tabRect(_i).width() >= _fm.horizontalAdvance(_t) + 8,
+              f"{_bar.tabRect(_i).width()} vs {_fm.horizontalAdvance(_t)}")
+    check("结果标签不省略", int(_bar.elideMode()) == int(_Qt2.ElideNone),
+          str(_bar.elideMode()))
     _n_tabs = w.result_tabs.count()
     if _n_tabs >= 2:
         w._on_result_tab_close(0)
@@ -1186,25 +1196,38 @@ def main():
           str(order_seq))
     w.set_scan_status("idle")
 
-    section("deauth 真实结果解析 + WPA3/PMF 提示 + 嗅探日志文案")
+    section("deauth 真实结果解析 + 注入不可用检测 + WPA3/PMF 提示 + 嗅探日志文案")
     _core = C.AirCore()
-    _core._run_sudo = lambda args: subprocess.CompletedProcess(
-        args, 0, "Sending 64 directed DeAuth (code 7). STMAC: [AA] [10|64 ACKs]", "")
+    _core._run_deauth = lambda args, timeout=8: (
+        0, "Sending 64 directed DeAuth (code 7). STMAC: [AA] [10|64 ACKs]")
     ok, m = _core.deauth("wlan0mon", "AA:00:00:00:00:01", 10, "BB:00:00:00:00:01")
     check("deauth 成功时返回 True 并含'已发送'", ok is True and "已发送" in m, m)
-    _core._run_sudo = lambda args: subprocess.CompletedProcess(
-        args, 1, "No such BSSID available.", "")
+    _core._run_deauth = lambda args, timeout=8: (
+        1, "No such BSSID available.")
     ok2, m2 = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
     check("deauth 找不到目标时返回 False 并说明",
           ok2 is False and "找不到" in m2, m2)
-    _core._run_sudo = lambda args: subprocess.CompletedProcess(
-        args, 1, "No such BSSID available.", "No such BSSID available.")
+    _core._run_deauth = lambda args, timeout=8: (
+        1, "No such BSSID available.")
     ok3, m3 = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
     check("deauth 失败描述不是空的", ok2 is False and bool(m2) and bool(m3), m3)
-    _core._run_sudo = lambda args: subprocess.CompletedProcess(
-        args, 1, "", "no privilege")
+    _core._run_deauth = lambda args, timeout=8: (1, "no privilege")
     _okp, _mp = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
     check("无提权时提示检查 ~/.Pas", _okp is False and "~/.Pas" in _mp, _mp)
+    # 网卡不支持注入时 aireplay 会挂住被强杀(rc=-9), 必须明确提示换网卡
+    _core._run_deauth = lambda args, timeout=8: (-9, "")
+    _okt, _mt = _core.deauth("wlan0mon", "AA:00:00:00:00:01")
+    check("deauth 超时判定为网卡不支持注入",
+          _okt is False and "不支持" in _mt and "网卡" in _mt, _mt)
+
+    # 应用侧: 连续 2 次注入失败即判定网卡不可注入并停止自动重发
+    w._injection_unsupported = False
+    w._deauth_fails = 0
+    _bad = "deauth 注入超时: 当前网卡/驱动不支持帧注入, 踢不动客户端"
+    w._on_deauth_result((False, _bad))
+    check("1 次失败还不下结论", w._injection_unsupported is False)
+    w._on_deauth_result((False, _bad))
+    check("2 次失败判定网卡不支持注入", w._injection_unsupported is True)
 
 
     # WPA3/SAE/PMF 目标必须给出明确提示(否则用户会一直干等)
