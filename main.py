@@ -233,6 +233,13 @@ class EasyAirApp(MainUI):
         self._load_history_tabs()
         self._refresh_cap_tree()
 
+        # minidwep 式实时状态行: 固定在日志区顶部原地刷新, 不再靠刷屏日志
+        self._crack_speed = ""
+        self.live_timer = QTimer(self)
+        self.live_timer.timeout.connect(self._refresh_live_status)
+        self.live_timer.setInterval(500)
+        self.live_timer.start()
+
         # 后台清掉上次异常退出遗留的扫描进程, 顺带探测 airodump 的
         # --background 支持(一次, 之后都是缓存结果)
         threading.Thread(target=self._cleanup_stale_scans, daemon=True).start()
@@ -299,6 +306,7 @@ class EasyAirApp(MainUI):
         self.btn_export.clicked.connect(self._export_results)
         self.btn_note.clicked.connect(self._edit_note)
         self.btn_del_record.clicked.connect(self._delete_record)
+        self.result_tabs.tabCloseRequested.connect(self._on_result_tab_close)
         self.log_tabs.currentChanged.connect(lambda _i: None)
 
         # AP 表格单击/双击选择目标并可开始抓包
@@ -442,6 +450,50 @@ class EasyAirApp(MainUI):
 
     def set_status(self, txt: str):
         self.status_label.setText(txt)
+
+    def _refresh_live_status(self):
+        """日志区顶部的实时状态行: 原地刷新, 不产生滚动。
+
+        类似 minidwep 的状态行 —— 阶段/耗时/客户端数/deauth 次数集中显示,
+        不再靠反复刷屏日志来表达。"""
+        if self._crack_running:
+            txt = (f"🔓 破解中 · 耗时 "
+                   f"{self._format_elapsed(self.crack_start_time)}")
+            if self._crack_speed:
+                txt += f" · 速度 {self._crack_speed}"
+            self._apply_live(txt, ("#ffe082", "#e65100", "#fff8e1"))
+            return
+        if getattr(self, "_auto_mode", False):
+            txt = (f"🤖 全自动抓包 · {self._auto_done}/{self._auto_total}"
+                   f" · 成功 {self._auto_ok}")
+            self._apply_live(txt, ("#90caf9", "#0d47a1", "#e3f2fd"))
+            return
+        if getattr(self, "_capture_running", False):
+            bssid = (getattr(self, "_cap_bssid", "") or "").upper()
+            n = len(self._ap_clients.get(bssid, []))
+            ch = getattr(self, "_cap_ch", "") or self.lbl_target_ch.text()
+            elapsed = self._format_elapsed(
+                getattr(self, "_cap_start", time.time()))
+            txt = (f"📡 抓包中 · {bssid} · CH{ch} · 在线客户端 {n} · "
+                   f"deauth {self._deauth_attempts} 次 · 耗时 {elapsed}")
+            self._apply_live(txt, ("#ffe082", "#e65100", "#fff8e1"))
+            return
+        if self.scan_timer.isActive():
+            txt = (f"🔍 扫描中 · 已发现 {self.ap_table.rowCount()} 个 AP · "
+                   f"剩余 {self._countdown_num()}s")
+            self._apply_live(txt, ("#a5d6a7", "#1b5e20", "#e8f5e9"))
+            return
+        self._apply_live("● 空闲", ("#cfd8dc", "#37474f", "#eceff1"))
+
+    def _apply_live(self, txt: str, colors):
+        if txt == getattr(self, "_live_last", ""):
+            return
+        self._live_last = txt
+        self.live_label.setText(txt)
+        border, fg, bg = colors
+        self.live_label.setStyleSheet(
+            f"padding:4px 8px; background:{bg}; border:1px solid {border};"
+            f" border-radius:4px; font-weight:bold; color:{fg};")
 
     # ===== 网卡 =====
     def _refresh_ifaces(self):
@@ -656,6 +708,18 @@ class EasyAirApp(MainUI):
         self.lbl_engine.setText(f"{engine}  |  {device}")
 
     # ===== 破解结果: 按日期归类 =====
+    def _make_result_tree(self, date: str) -> CrackResultWidget:
+        tree = CrackResultWidget()
+        for rec in self.core.history_records(date):
+            tree.load_record(rec)
+        # 右键菜单: 删除 / 备注 / 复制 / 打开握手包文件夹 / 清空列表
+        tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        tree.customContextMenuRequested.connect(
+            lambda pos, t=tree: self._result_menu(t, pos))
+        tree.itemSelectionChanged.connect(
+            lambda _t=date: self._sync_record_buttons(_t))
+        return tree
+
     def _load_history_tabs(self):
         self.result_tabs.blockSignals(True)
         while self.result_tabs.count():
@@ -669,15 +733,23 @@ class EasyAirApp(MainUI):
             dates.insert(0, today_str())
 
         for date in dates:
-            tree = CrackResultWidget()
-            for rec in history.get(date, []):
-                tree.load_record(rec)
+            tree = self._make_result_tree(date)
             n = tree.topLevelItemCount()
             self.result_tabs.addTab(tree, f"{date} ({n})")
-            tree.itemSelectionChanged.connect(
-                lambda _t=date: self._sync_record_buttons(_t))
         self.result_tabs.blockSignals(False)
         self.current_crack_date = self._tab_date(0) or today_str()
+
+    def _on_result_tab_close(self, index: int):
+        """关闭一个日期标签页。
+
+        关闭只影响显示, 历史记录仍在 history.json 里; 若全部关闭则补回
+        今天的空标签页, 保证右侧始终有一个可用的破解列表。"""
+        if index < 0 or self.result_tabs.count() <= 1:
+            # 保留最后一个: 否则右侧没有目标列表, 开始破解无处可写
+            if self.result_tabs.count() == 1:
+                self.set_status("至少保留一个破解结果标签页")
+            return
+        self.result_tabs.removeTab(index)
 
     def _tab_date(self, index=None) -> str:
         idx = self.result_tabs.currentIndex() if index is None else index
@@ -1009,6 +1081,96 @@ class EasyAirApp(MainUI):
             self._reload_current_tab()
         self.log(f"[删除] 已删除 {label} ({date})")
         return True
+
+    def _result_menu(self, tree, pos):
+        """右侧破解结果右键菜单。"""
+        item = tree.itemAt(pos)
+        if item is not None:
+            tree.setCurrentItem(item)
+        item = tree.current_record()
+        date = self._tab_date()
+        pwd = item.text(CrackResultWidget.COL_PWD) if item else ""
+        cap = item.text(CrackResultWidget.COL_CAP) if item else ""
+        has_pwd = bool(pwd) and pwd not in ("破解中...", "未找到", "已停止")
+        cap_dir = Path(cap).parent if cap else None
+
+        menu = QMenu(self)
+        act_copy_wifi = menu.addAction("📋 复制 WiFi (SSID+密码)")
+        act_copy_pwd = menu.addAction("🔑 复制密码")
+        act_note = menu.addAction("📝 备注")
+        menu.addSeparator()
+        act_folder = menu.addAction("📂 打开握手包所在文件夹")
+        act_reveal = menu.addAction("📦 定位到握手包库")
+        menu.addSeparator()
+        act_del = menu.addAction("🗑 删除记录")
+        act_clear = menu.addAction(f"🧹 清空 {date} 列表")
+        act_copy_wifi.setEnabled(item is not None and has_pwd)
+        act_copy_pwd.setEnabled(item is not None and has_pwd)
+        act_note.setEnabled(item is not None)
+        act_folder.setEnabled(bool(cap_dir) and cap_dir.is_dir())
+        act_reveal.setEnabled(bool(cap))
+        act_del.setEnabled(item is not None)
+        act_clear.setEnabled(tree.topLevelItemCount() > 0)
+
+        chosen = menu.exec_(tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_copy_wifi:
+            self._copy_wifi_credentials()
+        elif chosen == act_copy_pwd:
+            QApplication.clipboard().setText(pwd)
+            self.set_status("密码已复制到剪贴板")
+        elif chosen == act_note:
+            self._edit_note()
+        elif chosen == act_folder:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(cap_dir)))
+            self.set_status(f"已打开 {cap_dir}")
+        elif chosen == act_reveal:
+            self._reveal_cap_in_library(cap)
+        elif chosen == act_del:
+            self._delete_record()
+        elif chosen == act_clear:
+            self._clear_results_of_date(date)
+
+    def _refresh_result_tab_label(self, tree=None):
+        tree = tree or self._current_result_tree()
+        idx = self.result_tabs.currentIndex()
+        if tree is not None and idx >= 0:
+            self.result_tabs.setTabText(
+                idx, f"{self._tab_date(idx)} ({tree.topLevelItemCount()})")
+
+    def _reveal_cap_in_library(self, cap: str):
+        """切到握手包库标签页并选中指定的握手包文件。"""
+        if hasattr(self, "cap_page"):
+            self.bottom_tabs.setCurrentWidget(self.cap_page)
+        for i in range(self.cap_tree.topLevelItemCount()):
+            top = self.cap_tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                ch = top.child(j)
+                if ch.data(0, Qt.UserRole) == cap:
+                    self.cap_tree.clearSelection()
+                    self.cap_tree.setCurrentItem(ch)
+                    ch.setSelected(True)
+                    self.cap_tree.scrollToItem(ch)
+                    self.set_status("已在握手包库中定位")
+                    return
+        self.set_status("握手包库中未找到该文件")
+
+    def _clear_results_of_date(self, date: str):
+        recs = self.core.history_records(date)
+        if not recs:
+            return
+        if QMessageBox.question(
+                self, "确认清空",
+                f"清空 {date} 的全部 {len(recs)} 条破解记录?\n"
+                f"(只删除记录, 不影响握手包文件)",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        for _ in range(len(recs)):
+            self.core.history_delete(date, 0)
+        self._reload_current_tab()
+        self.set_status(f"已清空 {date} 的 {len(recs)} 条记录")
+        self.log(f"[清空] {date} 删除 {len(recs)} 条记录")
 
     # ===== 握手包库 =====
     def _refresh_cap_tree(self):
@@ -1771,6 +1933,7 @@ class EasyAirApp(MainUI):
         # 新一轮抓包: 嗅探缓存清零, 只统计本轮目标的在线客户端
         self._sniffed_clients = {}
         self._sniff_noticed = False
+        self._client_logged = False
         self._clear_pkt()
 
         # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
@@ -1816,6 +1979,7 @@ class EasyAirApp(MainUI):
             return proc
 
         self._capture_running = True
+        self._cap_start = time.time()
         self._handshake_found = False
         self._checking_handshake = False
         self._hs_last = None
@@ -2002,33 +2166,57 @@ class EasyAirApp(MainUI):
                       | set((getattr(self, "_sniffed_clients", None)
                              or {}).get(bssid, ())))
         self._ap_clients[bssid] = macs
+        # 左侧列表实时反映在线客户端数量(此前只更新下拉框, 左侧一直不变)
+        self._update_ap_row_clients(bssid, macs)
         combo = getattr(self, "client_combo", None)
-        if combo is None:
+        if combo is not None:
+            shown = [combo.itemData(i) for i in range(1, combo.count())]
+            if set(shown) != set(macs):
+                keep = self._selected_client()
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("全部 (广播)", "")
+                for m in macs:
+                    combo.addItem(m, m)
+                auto = None
+                if keep:
+                    i = combo.findData(keep)
+                    combo.setCurrentIndex(i if i >= 0 else 0)
+                elif macs and not getattr(self, "_client_auto_directed", False):
+                    # 发现目标自带在线客户端就自动定向一次: 广播 deauth 常被
+                    # AP/客户端忽略, 定向迫使其重连才是 EAPOL 的主要来源。
+                    self._client_auto_directed = True
+                    combo.setCurrentIndex(1)
+                    auto = macs[0]
+                combo.blockSignals(False)
+                if auto:
+                    self.log(f"[deauth] 已自动定向到 {auto}(下拉框可手动切回广播)")
+        # 只在首次检出时记一条; 之后数量在顶部实时状态行原地刷新, 不再刷屏
+        if macs and not getattr(self, "_client_logged", False):
+            self._client_logged = True
+            self.log(f"[客户端] {bssid} 检出 {len(macs)} 台在线客户端 "
+                     f"(数量见状态行, 明细见定向下拉框)")
+
+    def _update_ap_row_clients(self, bssid: str, macs):
+        """把目标 AP 在左侧列表的"客户端"列更新为当前在线数量。"""
+        bssid = (bssid or "").upper()
+        n = len(macs)
+        for row in range(self.ap_table.rowCount()):
+            it = self.ap_table.item(row, 4)   # 4 = BSSID 列
+            if it is None or it.text().upper() != bssid:
+                continue
+            cell = self.ap_table.item(row, 2)  # 2 = 客户端列
+            if cell is None:
+                cell = QTableWidgetItem("")
+                self.ap_table.setItem(row, 2, cell)
+            cell.setText(str(n) if n else "-")
+            cell.setForeground(QColor("#1565c0") if n else QColor("#b0bec5"))
+            if n:
+                macs_txt = ", ".join(macs[:4]) + (f" 等{n}个" if n > 4 else "")
+                cell.setToolTip(f"{n} 台在线客户端: {macs_txt}")
+            else:
+                cell.setToolTip("无在线客户端")
             return
-        shown = [combo.itemData(i) for i in range(1, combo.count())]
-        if set(shown) == set(macs):
-            return
-        keep = self._selected_client()
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItem("全部 (广播)", "")
-        for m in macs:
-            combo.addItem(m, m)
-        auto = None
-        if keep:
-            i = combo.findData(keep)
-            combo.setCurrentIndex(i if i >= 0 else 0)
-        elif macs and not getattr(self, "_client_auto_directed", False):
-            # 发现目标自带在线客户端就自动定向一次: 广播 deauth 常被
-            # AP/客户端忽略, 定向迫使其重连才是 EAPOL 的主要来源。
-            # 用户手动切回广播后不再打扰(只自动定向一次)。
-            self._client_auto_directed = True
-            combo.setCurrentIndex(1)
-            auto = macs[0]
-        combo.blockSignals(False)
-        if auto:
-            self.log(f"[deauth] 已自动定向到 {auto}(下拉框可手动切回广播)")
-        self.log(f"[客户端] {bssid} 在线客户端更新为 {len(macs)} 个")
 
     # ===== 独立客户端嗅探(tcpdump data 帧, 补 airodump 不列关联客户端) =====
     def _sniffer_acquire(self, tag: str):
@@ -2366,6 +2554,7 @@ class EasyAirApp(MainUI):
             "font-weight: bold;")
         self._crack_running = True
         self.crack_start_time = time.time()
+        self._crack_speed = ""
         self.crack_timer.start()
         self.bottom_tabs.setCurrentWidget(self.log_crack_box)
 
@@ -2431,6 +2620,7 @@ class EasyAirApp(MainUI):
         if "speed" in line.lower() or "速度" in line:
             m = re.search(r'([\d]+(?:\.\d+)?\s*[kMG]?H/s)', line)
             if m:
+                self._crack_speed = m.group(1)
                 self.lbl_progress.setText(
                     f"破解中... 已耗时: {self._format_elapsed(self.crack_start_time)} | 速度 {m.group(1)}"
                 )
@@ -2597,7 +2787,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.18.0"
+VERSION = "1.19.0"
 
 
 def _selftest() -> int:

@@ -528,6 +528,8 @@ class MainUI(QWidget):
         result_layout.setSpacing(6)
         self.result_tabs = QTabWidget()
         self.result_tabs.setDocumentMode(True)
+        # 标签可按需关闭(关闭只隐藏该日期视图, 历史记录仍在磁盘上)
+        self.result_tabs.setTabsClosable(True)
         # 历史日期 tab 过多时会被压缩并把日期省略成 "2026-10-…",
         # 改为按需出现滚动按钮且不省略, 保证日期始终完整可见
         self.result_tabs.setUsesScrollButtons(True)
@@ -651,6 +653,7 @@ class MainUI(QWidget):
         cap_btns.addWidget(self.btn_cap_add)
         cap_btns.addStretch()
         cap_layout.addLayout(cap_btns)
+        self.cap_page = cap_page
         self.bottom_tabs.addTab(cap_page, "📦 握手包库  (双击载入)")
 
         self.log_scan_box = self._make_log_box()
@@ -662,7 +665,21 @@ class MainUI(QWidget):
         self.bottom_tabs.addTab(self.log_crack_box, "🔓 破解日志")
         # 兼容旧引用
         self.log_tabs = self.bottom_tabs
-        return self.bottom_tabs
+
+        # 动态实时状态行(minidwep 式): 顶部一行原地刷新, 不随日志滚动
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(4)
+        self.live_label = QLabel("● 空闲")
+        self.live_label.setObjectName("liveStatus")
+        self.live_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.live_label.setStyleSheet(
+            "padding:4px 8px; background:#eceff1; border:1px solid #cfd8dc;"
+            " border-radius:4px; font-weight:bold; color:#37474f;")
+        v.addWidget(self.live_label)
+        v.addWidget(self.bottom_tabs)
+        return container
 
     @staticmethod
     def _app_stylesheet():

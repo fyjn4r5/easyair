@@ -1007,6 +1007,58 @@ def main():
     _dlg.deleteLater()
     _c.config["wordlists"] = _saved_wl
 
+    section("本轮: 右侧结果右键菜单/可关闭标签 + 实时状态行 + 左侧客户端数刷新")
+    check("结果标签可关闭", w.result_tabs.tabsClosable())
+    _n_tabs = w.result_tabs.count()
+    if _n_tabs >= 2:
+        w._on_result_tab_close(0)
+        check("关闭一个标签生效", w.result_tabs.count() == _n_tabs - 1,
+              f"{_n_tabs}->{w.result_tabs.count()}")
+    # 只剩一个时不允许关闭
+    while w.result_tabs.count() > 1:
+        w._on_result_tab_close(0)
+    w._on_result_tab_close(0)
+    check("至少保留一个结果标签", w.result_tabs.count() == 1)
+
+    # 结果树右键菜单相关方法存在
+    for _m in ("_result_menu", "_reveal_cap_in_library",
+               "_clear_results_of_date", "_update_ap_row_clients"):
+        check(f"存在 {_m}", hasattr(w, _m))
+
+    # 实时状态行: 空闲时应显示"空闲"且是一个非滚动标签
+    w._crack_running = False
+    w._capture_running = False
+    w._auto_mode = False
+    w.scan_timer.stop()
+    w._live_last = ""
+    w._refresh_live_status()
+    check("实时状态行存在", hasattr(w, "live_label"))
+    check("空闲时状态行显示空闲", "空闲" in w.live_label.text(),
+          w.live_label.text())
+
+    # 抓包中状态行显示在线客户端数量(原地刷新, 不新增日志)
+    _b = w.ap_table.item(0, 4).text() if w.ap_table.rowCount() else "AA:BB:CC:DD:EE:11"
+    w._capture_running = True
+    w._cap_bssid = _b
+    w._cap_ch = "6"
+    w._ap_clients[_b.upper()] = ["11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"]
+    w._deauth_attempts = 4
+    w._live_last = ""
+    w._refresh_live_status()
+    check("抓包状态行含在线客户端数量",
+          "在线客户端 2" in w.live_label.text(), w.live_label.text())
+
+    # 左侧列表客户端列随嗅探结果刷新
+    w.ap_table.setItem(0, 4, U.QTableWidgetItem(_b.upper()))
+    w.ap_table.setItem(0, 2, U.QTableWidgetItem("-"))
+    w._update_ap_row_clients(_b, ["11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff"])
+    check("左侧客户端列更新为数量",
+          w.ap_table.item(0, 2).text() == "2",
+          w.ap_table.item(0, 2).text())
+    check("左侧客户端列 tooltip 含明细",
+          "11:22:33:44:55:66" in w.ap_table.item(0, 2).toolTip())
+    w._capture_running = False
+
     section("本轮: 单击选目标/双击抓包 / 排序 / 提示去重")
     # 双击可触发抓包
     check("双击绑定已启用", hasattr(w.ap_table, "cellDoubleClicked")
