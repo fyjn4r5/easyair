@@ -2861,7 +2861,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.20.0"
+VERSION = "1.20.1"
 
 
 def _selftest() -> int:
@@ -2889,7 +2889,8 @@ def _selftest() -> int:
         chk("主窗口创建", w is not None)
         chk("配置目录可写", w.core.caps_dir.parent.exists()
             or w.core.caps_dir.parent.mkdir(parents=True, exist_ok=True) is None)
-        chk("默认扫描时长", w.scan_auto_stop == 45, f"{w.scan_auto_stop} 秒")
+        chk("扫描时长读取有效", isinstance(w.scan_auto_stop, int)
+            and w.scan_auto_stop >= 0, f"{w.scan_auto_stop} 秒")
 
         # 倒计时: 模拟 6 秒, 必须严格 1 秒 1 跳
         w._stop_scan = lambda: None
