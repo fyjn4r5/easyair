@@ -1730,6 +1730,11 @@ class EasyAirApp(MainUI):
 
         cap_prefix = self.core.safe_cap_prefix(essid, bssid)
         self._cap_prefix = cap_prefix
+        # 抓包目标启动时即锁定: 刷新客户端必须用它, 不能用界面标签 ——
+        # 抓包中途用户点选别的 AP 会改掉标签, 导致刷成别的 AP 的客户端。
+        self._cap_bssid = bssid
+        self._cap_essid = essid
+        self._client_auto_directed = False
         client = self._selected_client()
 
         def _capture():
@@ -1920,7 +1925,9 @@ class EasyAirApp(MainUI):
         if not getattr(self, "_capture_running", False):
             return
         pref = getattr(self, "_cap_prefix", "")
-        bssid = self.lbl_target_bssid.text().upper()
+        # 用启动时锁定的 BSSID, 不用界面标签(中途点选会改掉标签)
+        bssid = ((getattr(self, "_cap_bssid", "") or "").upper()
+                 or self.lbl_target_bssid.text().upper())
         if not pref or not bssid:
             return
         try:
@@ -1955,10 +1962,20 @@ class EasyAirApp(MainUI):
         combo.addItem("全部 (广播)", "")
         for m in macs:
             combo.addItem(m, m)
+        auto = None
         if keep:
             i = combo.findData(keep)
             combo.setCurrentIndex(i if i >= 0 else 0)
+        elif macs and not getattr(self, "_client_auto_directed", False):
+            # 发现目标自带在线客户端就自动定向一次: 广播 deauth 常被
+            # AP/客户端忽略, 定向迫使其重连才是 EAPOL 的主要来源。
+            # 用户手动切回广播后不再打扰(只自动定向一次)。
+            self._client_auto_directed = True
+            combo.setCurrentIndex(1)
+            auto = macs[0]
         combo.blockSignals(False)
+        if auto:
+            self.log(f"[deauth] 已自动定向到 {auto}(下拉框可手动切回广播)")
         self.log(f"[客户端] {bssid} 在线客户端更新为 {len(macs)} 个")
 
     # ===== 独立客户端嗅探(tcpdump data 帧, 补 airodump 不列关联客户端) =====
@@ -2471,7 +2488,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.16.0"
+VERSION = "1.16.1"
 
 
 def _selftest() -> int:

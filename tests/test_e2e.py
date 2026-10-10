@@ -1619,6 +1619,8 @@ def main():
     # 抓包期间客户端数量自动刷新
     w._capture_running = True
     w._cap_prefix = "UnitTestCap"
+    w._cap_bssid = "AA:BB:CC:DD:EE:22"
+    w._client_auto_directed = True
     w.lbl_target_bssid.setText("AA:BB:CC:DD:EE:22")
     (_d2 / "UnitTestCap-01.csv").write_text(
         "Station MAC, First time seen, Last time seen, Power, # packets, "
@@ -1634,6 +1636,54 @@ def main():
           str([w.client_combo.itemData(i) for i in range(w.client_combo.count())]))
     check("deauth 间隔改为 30 秒", w._DEAUTH_INTERVAL_MS == 30000,
           str(w._DEAUTH_INTERVAL_MS))
+    # 抓包中途点选别的 AP, 刷新仍用启动锁定的目标(不用界面标签)
+    w._capture_running = True
+    w._cap_prefix = "UnitTestCap"
+    w._cap_bssid = "AA:BB:CC:DD:EE:22"
+    w._client_auto_directed = True
+    w._sniffed_clients = {}
+    w.lbl_target_bssid.setText("FF:FF:FF:FF:FF:FF")
+    (_d2 / "UnitTestCap-01.csv").write_text(
+        "Station MAC, First time seen, Last time seen, Power, # packets, "
+        "BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1, "
+        "AA:BB:CC:DD:EE:22,\r\n")
+    w.client_combo.clear()
+    w.client_combo.addItem("全部 (广播)", "")
+    w._refresh_capture_clients()
+    check("中途点选不带跑刷新目标",
+          w._ap_clients.get("AA:BB:CC:DD:EE:22") == ["0E:BE:B2:FD:94:88"]
+          and w.client_combo.itemData(1) == "0E:BE:B2:FD:94:88",
+          str(w._ap_clients))
+    # 发现目标自带客户端自动定向一次
+    (_d2 / "UnitTestCap-01.csv").write_text(
+        "Station MAC, First time seen, Last time seen, Power, # packets, "
+        "BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1, "
+        "AA:BB:CC:DD:EE:22,\r\n"
+        "1E:BE:B2:FD:94:88, 2026-10-05 16:19:39, 2026-10-05 16:19:39, -70, 2, "
+        "AA:BB:CC:DD:EE:22,\r\n")
+    w._client_auto_directed = False
+    w.client_combo.setCurrentIndex(0)
+    w._refresh_capture_clients()
+    check("自动定向到首个客户端",
+          w._selected_client() == "0E:BE:B2:FD:94:88"
+          and w._client_auto_directed is True,
+          w._selected_client())
+    # 用户手动切回广播后, 再来新客户端也不打扰
+    (_d2 / "UnitTestCap-01.csv").write_text(
+        "Station MAC, First time seen, Last time seen, Power, # packets, "
+        "BSSID, Probed ESSIDs\r\n"
+        "0E:BE:B2:FD:94:88, 2026-10-05 16:19:38, 2026-10-05 16:19:38, -74, 1, "
+        "AA:BB:CC:DD:EE:22,\r\n"
+        "1E:BE:B2:FD:94:88, 2026-10-05 16:19:39, 2026-10-05 16:19:39, -70, 2, "
+        "AA:BB:CC:DD:EE:22,\r\n"
+        "2E:BE:B2:FD:94:88, 2026-10-05 16:19:40, 2026-10-05 16:19:40, -68, 3, "
+        "AA:BB:CC:DD:EE:22,\r\n")
+    w.client_combo.setCurrentIndex(0)
+    w._refresh_capture_clients()
+    check("手动切回广播后不再自动定向", w._selected_client() == "",
+          w._selected_client())
     w._capture_running = False
     (_d2 / "UnitTestCap-01.csv").unlink(missing_ok=True)
     (_d2 / "UnitTestCap-01.cap").unlink(missing_ok=True)
