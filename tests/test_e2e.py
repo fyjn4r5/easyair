@@ -937,6 +937,76 @@ def main():
     check("复制后有状态提示", "已复制" in w.status_label.text(),
           w.status_label.text())
 
+    section("本轮: 握手包库右键打开文件夹/复制路径 + 待破解状态 + 字典持久化")
+    # 新加入的破解目标应为"待破解", 而不是未跑就显示"进行中"
+    check("新目标默认待破解",
+          it.text(U.CrackResultWidget.COL_STATE) == "待破解",
+          it.text(U.CrackResultWidget.COL_STATE))
+
+    # 右键"打开所在文件夹"定位到握手包所在目录
+    from PyQt5.QtCore import Qt as _Qt2
+    w.cap_tree.clearSelection()
+    kids[0].setSelected(True)
+    w.cap_tree.setCurrentItem(kids[0])
+    _dir = w._cap_target_dir()
+    check("打开文件夹定位到真实目录",
+          _dir is not None and _dir.is_dir(), str(_dir))
+
+    import main as _M
+    _opened = {}
+
+    class _FakeDesktop:
+        @staticmethod
+        def openUrl(url):
+            _opened["u"] = url.toLocalFile()
+
+    _real_desktop = _M.QDesktopServices
+    _M.QDesktopServices = _FakeDesktop
+    try:
+        w._open_cap_folder()
+    finally:
+        _M.QDesktopServices = _real_desktop
+    check("右键打开文件夹调用了系统文件管理器",
+          _opened.get("u") == str(_dir), str(_opened))
+
+    # 复制路径
+    w.cap_tree.clearSelection()
+    kids[0].setSelected(True)
+    w.cap_tree.setCurrentItem(kids[0])
+    w._copy_cap_path()
+    _clip = _QA.clipboard().text()
+    check("复制路径含该握手包路径",
+          str(kids[0].data(0, _Qt2.UserRole)) in _clip, _clip)
+
+    # 旧记录里遗留的"进行中"重启后显示"待破解"
+    _rt = U.CrackResultWidget()
+    _ri = _rt.load_record({"bssid": "AA", "essid": "E", "cap": "c.cap",
+                           "status": "进行中", "password": "破解中..."})
+    check("遗留'进行中'迁移为待破解",
+          _ri.text(U.CrackResultWidget.COL_STATE) == "待破解",
+          _ri.text(U.CrackResultWidget.COL_STATE))
+    check("遗留占位密码显示为空",
+          _ri.text(U.CrackResultWidget.COL_PWD) == "")
+
+    # 字典: 已保存但暂时不存在的路径不丢, 且对话框仍显示
+    _c = w.core
+    _saved_wl = _c.config.get("wordlists", [])
+    _c.config["wordlists"] = ["/nonexistent/easyair-test.dict",
+                              str(kids[0].data(0, _Qt2.UserRole))]
+    check("已保存字典保留不存在的路径",
+          "/nonexistent/easyair-test.dict" in _c.get_saved_wordlists())
+    check("缺失的字典不参与实际破解",
+          "/nonexistent/easyair-test.dict" not in _c.get_wordlists())
+    _dlg = U.WordListDialog(w, _c.get_saved_wordlists())
+    check("字典对话框显示已保存但缺失的条目",
+          _dlg.list_widget.count() == 2, str(_dlg.list_widget.count()))
+    _dlg.list_widget.setCurrentRow(0)
+    _dlg._remove_selected()
+    check("移除后 get_wordlists 同步", len(_dlg.get_wordlists()) == 1,
+          str(_dlg.get_wordlists()))
+    _dlg.deleteLater()
+    _c.config["wordlists"] = _saved_wl
+
     section("本轮: 单击选目标/双击抓包 / 排序 / 提示去重")
     # 双击可触发抓包
     check("双击绑定已启用", hasattr(w.ap_table, "cellDoubleClicked")

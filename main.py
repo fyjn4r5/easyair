@@ -14,8 +14,8 @@ from typing import Optional
 from PyQt5.QtWidgets import (QApplication, QMessageBox, QTableWidgetItem,
                              QFileDialog, QInputDialog, QTreeWidgetItem,
                              QMenu)
-from PyQt5.QtCore import QThread, pyqtSignal, QTimer, QEventLoop, Qt
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import QThread, pyqtSignal, QTimer, QEventLoop, Qt, QUrl
+from PyQt5.QtGui import QFont, QColor, QDesktopServices
 
 from ui.main_ui import MainUI, WordListDialog, CrackSettingsDialog, CrackResultWidget
 from core.aircore import AirCore, today_str
@@ -627,7 +627,7 @@ class EasyAirApp(MainUI):
         pass  # 不在主界面显示
 
     def _open_dict_manager(self):
-        dlg = WordListDialog(self, self.core.get_wordlists())
+        dlg = WordListDialog(self, self.core.get_saved_wordlists())
         if dlg.exec_() == WordListDialog.Accepted:
             new_lists = dlg.get_wordlists()
             self.core.config["wordlists"] = new_lists
@@ -700,14 +700,23 @@ class EasyAirApp(MainUI):
             item.setSelected(True)
         menu = QMenu(self)
         act_add = menu.addAction("➕ 加入右侧破解")
+        act_folder = menu.addAction("📂 打开所在文件夹")
+        act_copy = menu.addAction("📋 复制路径")
+        act_note = menu.addAction("📝 编辑备注")
+        menu.addSeparator()
         act_del = menu.addAction("🗑 删除选中")
         act_clear = menu.addAction("🧹 清空全部")
-        act_note = menu.addAction("📝 编辑备注")
         chosen = menu.exec_(self.cap_tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
         if chosen == act_add:
             self._batch_add_to_crack()
+            return
+        if chosen == act_folder:
+            self._open_cap_folder()
+            return
+        if chosen == act_copy:
+            self._copy_cap_path()
             return
         if chosen == act_note:
             if item:
@@ -788,6 +797,47 @@ class EasyAirApp(MainUI):
                 pass
         self._refresh_cap_tree()
         self.set_status(f"已清空 {n} 个握手包")
+
+    def _cap_target_dir(self) -> Optional[Path]:
+        """右键"打开所在文件夹"要用的目录: 取当前项的父目录。
+
+        子项(握手包)的 UserRole 是文件路径 -> 用其父目录;
+        顶层(日期分组)的 UserRole 是日期字符串 -> 用 captures/<日期>。
+        """
+        item = self.cap_tree.currentItem()
+        if item is not None:
+            v = item.data(0, Qt.UserRole)
+            if v:
+                p = Path(v)
+                if p.is_file():
+                    return p.parent
+                if p.is_dir():
+                    return p
+                dated = self.core.caps_dir / str(v)
+                if dated.is_dir():
+                    return dated
+        return self.core.caps_dir
+
+    def _open_cap_folder(self):
+        d = self._cap_target_dir()
+        if not d or not d.is_dir():
+            self.set_status("未找到握手包所在文件夹")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
+        self.set_status(f"已打开 {d}")
+
+    def _copy_cap_path(self):
+        caps = self._selected_caps()
+        if caps:
+            text = "\n".join(str(c) for c in caps)
+        else:
+            d = self._cap_target_dir()
+            if not d:
+                return
+            text = str(d)
+        QApplication.clipboard().setText(text)
+        self.set_status("路径已复制到剪贴板")
+        self.log(f"[复制] 路径: {text}")
 
     def _batch_add_to_crack(self):
         """把握手包库中选中的多个握手包批量加入右侧列表。"""
@@ -2296,6 +2346,9 @@ class EasyAirApp(MainUI):
         self.current_crack_date = self._tab_date()
         self.current_crack_item = tree.add_target(bssid, essid, str(cap))
         self.current_crack_tree = tree
+        # 真正开始跑了才标记"进行中", 未跑前保持"待破解"
+        self.current_crack_item.setText(CrackResultWidget.COL_STATE, "进行中")
+        self.current_crack_item.setText(CrackResultWidget.COL_TIME, "00:00")
         idx = tree.indexOfTopLevelItem(self.current_crack_item)
         self.core.history_add(self.current_crack_date, tree.to_record(self.current_crack_item))
         self.result_tabs.setTabText(
@@ -2544,7 +2597,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.17.0"
+VERSION = "1.18.0"
 
 
 def _selftest() -> int:

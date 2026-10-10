@@ -69,7 +69,11 @@ class WordListDialog(QDialog):
     def _load_lists(self):
         self.list_widget.clear()
         for wl in self.wordlists:
-            self.list_widget.addItem(wl)
+            item = QListWidgetItem(wl)
+            if not Path(wl).exists():
+                item.setForeground(QColor("#c62828"))
+                item.setToolTip("文件不存在（可能已移动或改名），破解时会被忽略")
+            self.list_widget.addItem(item)
 
     def _show_menu(self, pos):
         menu = QMenu(self)
@@ -129,7 +133,10 @@ class WordListDialog(QDialog):
         self.list_widget.clear()
 
     def get_wordlists(self):
-        return self.wordlists
+        # 以列表控件当前顺序为准, 这样上移/下移/拖拽排序后能真正生效
+        items = [self.list_widget.item(i).text()
+                 for i in range(self.list_widget.count())]
+        return items if items else list(self.wordlists)
 
 
 class CrackResultWidget(QTreeWidget):
@@ -149,7 +156,7 @@ class CrackResultWidget(QTreeWidget):
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
 
     def add_target(self, bssid, essid, cap_file, note=""):
-        item = QTreeWidgetItem([bssid, essid, "", cap_file, "进行中", "00:00", note])
+        item = QTreeWidgetItem([bssid, essid, "", cap_file, "待破解", "00:00", note])
         item.setData(0, Qt.UserRole, {"bssid": bssid, "essid": essid, "cap": cap_file})
         self.addTopLevelItem(item)
         return item
@@ -169,17 +176,21 @@ class CrackResultWidget(QTreeWidget):
         pwd = rec.get("password", "") or ""
         if pwd == "破解中...":      # 旧记录里遗留的占位, 统一显示为空
             pwd = ""
+        # 破解不会在重启后继续: 上次异常退出留下的"进行中"统一显示为待破解,
+        # 否则用户会以为没在跑却一直"破解中"。
+        state = rec.get("status", "") or ""
+        if state == "进行中":
+            state = "待破解"
         item = QTreeWidgetItem([
             rec.get("bssid", ""), rec.get("essid", ""),
             pwd,
-            rec.get("cap", ""), rec.get("status", ""),
+            rec.get("cap", ""), state,
             rec.get("elapsed", ""), rec.get("note", ""),
         ])
         self.addTopLevelItem(item)
-        state = rec.get("status", "")
         if state == "成功":
             self._paint_success(item)
-        elif state and state not in ("进行中",):
+        elif state and state not in ("进行中", "待破解"):
             item.setText(self.COL_STATE, state)
             item.setForeground(self.COL_STATE, QColor("#c62828"))
         return item

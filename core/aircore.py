@@ -138,6 +138,13 @@ class AirCore:
     def get_wordlists(self) -> List[str]:
         return [p for p in self.config["wordlists"] if Path(p).exists()]
 
+    def get_saved_wordlists(self) -> List[str]:
+        """配置里保存的全部字典路径(不过滤存在性)。
+
+        字典管理对话框用它来显示: 文件被移动/改名时列表不再"凭空消失",
+        用户可在对话框里看到并修正, 而不是每次重启都要重新添加。"""
+        return list(self.config.get("wordlists", []))
+
     def set_use_gpu(self, use_gpu: bool):
         self.config["use_gpu"] = use_gpu
         self.save_config()
