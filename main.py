@@ -1195,6 +1195,7 @@ class EasyAirApp(MainUI):
         # 新一轮扫描: 嗅探缓存清零, 避免上一轮的客户端"阴魂不散"
         self._sniffed_clients = {}
         self._sniff_noticed = False
+        self._clear_pkt()
         self.btn_scan.setText("⏹ 扫描中")
         self._arm_scan_clock()
         if self.scan_deadline:
@@ -1720,6 +1721,7 @@ class EasyAirApp(MainUI):
         # 新一轮抓包: 嗅探缓存清零, 只统计本轮目标的在线客户端
         self._sniffed_clients = {}
         self._sniff_noticed = False
+        self._clear_pkt()
 
         # 顺序很关键: 必须先让 airodump 开始抓包, 再发 deauth。
         # 反过来(先 deauth 后开抓)会漏掉客户端重连的那几帧 EAPOL,
@@ -2005,7 +2007,7 @@ class EasyAirApp(MainUI):
         t = self._spawn_cmd(proc, self._on_sniffer_line)
         t.finished.connect(lambda: self._forget_sniffer(t))
         self._sniffer_thread = t
-        self.log("[客户端] 已启动数据帧嗅探(补全在线客户端)")
+        self.log("[客户端] 已启动数据帧嗅探 · 实时帧见下方'📶 数据帧'标签页")
 
     def _forget_sniffer(self, t):
         if getattr(self, "_sniffer_thread", None) is t:
@@ -2026,6 +2028,8 @@ class EasyAirApp(MainUI):
                 pass
 
     def _on_sniffer_line(self, line: str):
+        # 实时数据帧窗口: 把抓到的帧显示到"数据帧"标签页(像 minidwep 的信息窗口)
+        self._append_pkt(line)
         try:
             hit = self.core.parse_sniffer_line(line)
         except Exception:
@@ -2040,6 +2044,58 @@ class EasyAirApp(MainUI):
         if not getattr(self, "_sniff_noticed", False):
             self._sniff_noticed = True
             self.log(f"[客户端] 嗅探到在线客户端 {mac} (AP {bssid})")
+
+    _BCAST = ("FF:FF:FF:FF:FF:FF", "01:00:5E", "33:33", "01:80:C2")
+
+    def _format_pkt_line(self, line: str):
+        """把一行 tcpdump -e 输出压成简短可读的帧信息, 无效/噪音返回 None。"""
+        if not line or "SA:" not in line:
+            return None
+        low = line.lower()
+        if "probe request" in low:
+            kind = "PROBE"
+        elif "deauth" in low:
+            kind = "DEAUTH"
+        elif "disassoc" in low:
+            kind = "DISSOC"
+        elif "eapol" in low:
+            kind = "EAPOL"
+        elif "qos data" in low or " data" in low or " cf" in low:
+            kind = "DATA"
+        else:
+            return None
+        sa = re.search(r"\bSA:([0-9A-Fa-f:]{17})\b", line)
+        bs = re.search(r"\bBSSID:([0-9A-Fa-f:]{17})\b", line)
+        da = re.search(r"\bDA:([0-9A-Fa-f:]{17})\b", line)
+        if not sa:
+            return None
+        src = sa.group(1).upper()
+        ap = bs.group(1).upper() if bs else "?"
+        dst = da.group(1).upper() if da else ""
+        if "probe request" in low:
+            body = f"{src} → (探测请求)"
+        else:
+            body = f"{src} → {ap}"
+        bcast = dst.startswith(self._BCAST)
+        tail = "  [广播]" if bcast else ""
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        return f"[{stamp}] {kind:<7} {body}{tail}"
+
+    def _append_pkt(self, line: str):
+        box = getattr(self, "pkt_box", None)
+        if box is None:
+            return
+        try:
+            txt = self._format_pkt_line(line)
+        except Exception:
+            return
+        if txt:
+            box.appendPlainText(txt)
+
+    def _clear_pkt(self):
+        box = getattr(self, "pkt_box", None)
+        if box is not None:
+            box.clear()
 
     def _auto_on_target_done(self, cap):
         """全自动模式: 记录本次成功, 然后抓下一个。"""
@@ -2488,7 +2544,7 @@ class EasyAirApp(MainUI):
             QMessageBox.warning(self, "错误", f"导出失败: {e}")
 
 
-VERSION = "1.16.1"
+VERSION = "1.17.0"
 
 
 def _selftest() -> int:

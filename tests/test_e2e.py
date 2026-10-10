@@ -82,10 +82,12 @@ def main():
           str(w.lbl_engine.parent()))
 
     section("布局: 底部标签页")
-    check("底部有 3 个 tab", w.bottom_tabs.count() == 3, str(w.bottom_tabs.count()))
+    check("底部有 4 个 tab", w.bottom_tabs.count() == 4, str(w.bottom_tabs.count()))
+    check("底部 4 个标签页", w.bottom_tabs.count() == 4, str(w.bottom_tabs.count()))
     check("tab0=握手包库", "握手包库" in w.bottom_tabs.tabText(0), w.bottom_tabs.tabText(0))
     check("tab1=抓包日志", "抓包" in w.bottom_tabs.tabText(1), w.bottom_tabs.tabText(1))
-    check("tab2=破解日志", "破解" in w.bottom_tabs.tabText(2), w.bottom_tabs.tabText(2))
+    check("tab2=数据帧", "数据帧" in w.bottom_tabs.tabText(2), w.bottom_tabs.tabText(2))
+    check("tab3=破解日志", "破解" in w.bottom_tabs.tabText(3), w.bottom_tabs.tabText(3))
     check("握手包库已移入底部tab", w.cap_tree.parent() is not w.ap_table.parent())
     check("两个日志框独立", w.log_scan_box is not w.log_crack_box)
     check("日志框有行数上限", w.log_scan_box.maximumBlockCount() > 0)
@@ -1808,6 +1810,32 @@ def main():
            "DA:ff:ff:ff:ff:ff:ff SA:84:87:ff:aa:36:74 Beacon (X)")
     check("Beacon 不算客户端", _P(_l4) is None, str(_P(_l4)))
     check("无BSSID行不算", _P("garbage line") is None, "x")
+    # 探测请求(BSSID 是广播)不能被当成某 AP 的客户端
+    _l5 = ("10:00:00.1 x DA:ff:ff:ff:ff:ff:ff BSSID:ff:ff:ff:ff:ff:ff "
+           "SA:aa:bb:cc:dd:ee:01 Probe Request ()")
+    check("探测请求不产生客户端", _P(_l5) is None, str(_P(_l5)))
+
+    section("实时数据帧窗口(像 minidwep 显示 data/广播帧)")
+    _F = w._format_pkt_line
+    _d = _F(_l1)  # DATA, DA 广播
+    check("数据帧显示为 DATA", _d and "DATA" in _d
+          and "98:3F:A4:67:36:D0" in _d and "6C:11:BA:9F:63:EF" in _d, str(_d))
+    check("广播数据帧标注[广播]", _d and "[广播]" in _d, str(_d))
+    _d2 = _F(_l3)  # QoS Data, DA 单播
+    check("单播数据帧不标广播", _d2 and "DATA" in _d2
+          and "[广播]" not in _d2, str(_d2))
+    _de = ("10:00:01.0 x DA:ff:ff:ff:ff:ff:ff BSSID:11:22:33:44:55:66 "
+           "SA:11:22:33:44:55:66 DeAuthentication ()")
+    _df = _F(_de)
+    check("去认证帧显示 DEAUTH+广播", _df and "DEAUTH" in _df
+          and "[广播]" in _df, str(_df))
+    _pf = _F(_l5)
+    check("探测请求显示 PROBE", _pf and "PROBE" in _pf, str(_pf))
+    check("Beacon 不进数据帧窗口", _F(_l4) is None, str(_F(_l4)))
+    w._clear_pkt()
+    w._append_pkt(_l1)
+    check("数据帧窗口收到内容",
+          "DATA" in w.pkt_box.toPlainText(), w.pkt_box.toPlainText()[:60])
     # _on_sniffer_line 累积
     w._sniffed_clients = {}
     w._sniff_noticed = True  # 不刷日志

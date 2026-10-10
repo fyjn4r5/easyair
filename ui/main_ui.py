@@ -644,7 +644,10 @@ class MainUI(QWidget):
 
         self.log_scan_box = self._make_log_box()
         self.log_crack_box = self._make_log_box()
+        # 实时数据帧窗口(类似 minidwep 的信息窗口): 显示抓到的 data/广播帧
+        self.pkt_box = self._make_log_box(4000)
         self.bottom_tabs.addTab(self.log_scan_box, "📡 抓包日志")
+        self.bottom_tabs.addTab(self.pkt_box, "📶 数据帧")
         self.bottom_tabs.addTab(self.log_crack_box, "🔓 破解日志")
         # 兼容旧引用
         self.log_tabs = self.bottom_tabs
@@ -711,10 +714,10 @@ class MainUI(QWidget):
         }
         """
 
-    def _make_log_box(self):
+    def _make_log_box(self, max_blocks: int = 800):
         box = QPlainTextEdit()
         box.setReadOnly(True)
-        box.setMaximumBlockCount(800)
+        box.setMaximumBlockCount(max_blocks)
         box.setFont(QFont("Monospace", 9))
         box.setLineWrapMode(QPlainTextEdit.NoWrap)
         return box

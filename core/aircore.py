@@ -466,19 +466,23 @@ class AirCore:
         return self.run_cmd(cmd, sudo=True)
 
     def start_client_sniffer(self, mon_iface: str):
-        """独立客户端嗅探: tcpdump 只抓 802.11 数据帧(BPF 在内核过滤)。
+        """独立客户端嗅探 + 实时数据帧窗口数据源(BPF 在内核过滤)。
 
         背景: 实测 airodump-ng 1.6 在本机监听接口上, Station 段长期只写
         "(not associated)" —— 即使网卡明明抓到了客户端数据帧(tcpdump 可见
         SA→BSSID 的 Data, AP 的 IV 计数也在涨)。于是 AP 表"客户端"列永远
         为 0。这不是解析 bug, 是 airodump 不归因。用 tcpdump 兜底, 把真实
-        在线的已关联客户端找回来。数据帧远少于 beacon, 开销很小。
+        在线的已关联客户端找回来, 同时把这些帧显示到"数据帧"窗口。
+        过滤: 数据帧 + 解关联/去认证 + 探测请求(都是人想看的关键帧),
+        排除 beacon(量太大且无信息量)。
         """
         if not shutil.which("tcpdump"):
             return None
+        flt = ("type data or type mgt subtype deauth or "
+               "type mgt subtype disassoc or type mgt subtype probe-req")
         try:
             return self.run_cmd(
-                f"tcpdump -i {mon_iface} -e -l -nn type data", sudo=True)
+                f"tcpdump -i {mon_iface} -e -l -nn '{flt}'", sudo=True)
         except (OSError, PermissionError, ValueError):
             return None
 
@@ -506,6 +510,10 @@ class AirCore:
             if not da:
                 return None
             client = da.group(1).upper()
+        # BSSID 是广播/组播(如 Probe Request)的帧不能当作"某 AP 的客户端"
+        if (bssid in ("FF:FF:FF:FF:FF:FF", "00:00:00:00:00:00")
+                or bssid.startswith("01:")):
+            return None
         # 组播/广播/生成树等不是客户端
         if (client == bssid or client.startswith("FF:")
                 or client.startswith(("01:00:5E", "33:33",
