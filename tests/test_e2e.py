@@ -632,15 +632,25 @@ def main():
     check("扫描停止已持久化", saved.get("scan_auto_stop") == 60, str(saved))
     check("auto_monitor 已持久化", saved.get("auto_monitor") is False, str(saved))
 
-    C.CONFIG_FILE = C.Path.home() / ".easyair" / "config" / "settings.json"
-    w.core.config["crack_engine"] = "Aircrack-ng (CPU)"
-    w.core.config["crack_device"] = "CPU"
-    w.core.save_config()
-    check("打包后写入用户目录", C.CONFIG_FILE.exists(),
-          str(C.CONFIG_FILE))
-    check("用户目录为 ~/.easyair",
-          C.CONFIG_FILE.parent.parent.name == ".easyair",
-          str(C.CONFIG_FILE))
+    # 打包后应落到 ~/.easyair —— 只断言路径推断, 绝不真写用户主目录
+    _frozen_saved = getattr(sys, "frozen", None)
+    sys.frozen = True
+    try:
+        _dd = C._data_dir()
+    finally:
+        if _frozen_saved is None:
+            del sys.frozen
+        else:
+            sys.frozen = _frozen_saved
+    check("打包后数据目录为 ~/.easyair",
+          _dd == C.Path.home() / ".easyair", str(_dd))
+    check("打包后配置落在 ~/.easyair/config",
+          _dd / "config" / "settings.json"
+          == C.Path.home() / ".easyair" / "config" / "settings.json",
+          str(_dd / "config" / "settings.json"))
+    # 保持配置写在临时目录, 不要污染真实的 ~/.easyair
+    C.CONFIG_FILE = cfgdir / "settings.json"
+    C.HISTORY_FILE = cfgdir / "history.json"
     w.core.config["crack_engine"] = "Hashcat (GPU/CPU)"
     w.core.config["crack_device"] = "GPU + CPU (自动)"
     w.core.config["auto_monitor"] = True
@@ -1295,8 +1305,12 @@ def main():
 
     # 旧配置迁移: 存了 0 的旧配置应升级为 45
     import core.aircore as AC, json
+    _mig = tmp / "migrate"
+    _mig.mkdir(exist_ok=True)
+    _saved_cfg, _saved_hist = AC.CONFIG_FILE, AC.HISTORY_FILE
+    AC.CONFIG_FILE = _mig / "settings.json"
+    AC.HISTORY_FILE = _mig / "history.json"
     old_cfg = {"scan_auto_stop": 0, "use_gpu": True}
-    AC.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     AC.CONFIG_FILE.write_text(json.dumps(old_cfg))
     ac = AC.AirCore()
     check("旧配置 0 迁移为 45", ac.config["scan_auto_stop"] == 45,
@@ -1306,7 +1320,7 @@ def main():
     ac2 = AC.AirCore()
     check("用户显式设 0 保留", ac2.config["scan_auto_stop"] == 0,
           str(ac2.config["scan_auto_stop"]))
-    AC.CONFIG_FILE.unlink()
+    AC.CONFIG_FILE, AC.HISTORY_FILE = _saved_cfg, _saved_hist
 
     # ---- 握手包库: 右键删除/清空/加入跑包界面 ----
     section("握手包库删除/清空/批量加入")
@@ -1613,6 +1627,7 @@ def main():
     # 回归: 点扫描后必须立刻出现倒计时。之前计时在 _do_scan() 里, 而
     # _do_scan() 要等 start_monitor, 表现为"按下没反应"。
     w2 = M.EasyAirApp()
+    w2.scan_auto_stop = 45  # 固定值, 不依赖磁盘配置
     w2.mon_iface = None
     w2._preflight_scan = lambda: True
     w2.iface_combo.currentText = lambda: "wlan0"
